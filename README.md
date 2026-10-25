@@ -79,6 +79,30 @@ max tx power=78,ret=0
 
 ---
 
+## Development Environment (PlatformIO + ESP-IDF in C)
+
+This project uses **PlatformIO** with the official **ESP-IDF** C framework (`framework = espidf`), targeting the ESP32's built-in FreeRTOS kernel, GPIO drivers (`driver/gpio.h`), and Two-Wire Automotive Interface CAN controller (`driver/twai.h`).
+
+### Project Structure
+- `platformio.ini` — PlatformIO configuration (`board = esp32dev`, `framework = espidf`)
+- `CMakeLists.txt` & `src/CMakeLists.txt` — ESP-IDF CMake build definitions
+- `src/main.c` — Pure C application entry point (`app_main`)
+
+### Build, Flash, and Serial Monitor Commands
+
+```bash
+# Build the C firmware
+.venv/bin/pio run
+
+# Build and flash to /dev/ttyUSB0 (writes bootloader.bin @ 0x1000, partitions.bin @ 0x8000, firmware.bin @ 0x10000)
+.venv/bin/pio run -t upload
+
+# Open the 115200 baud serial monitor
+.venv/bin/pio device monitor
+```
+
+---
+
 ## Host Serial Port Setup (Linux)
 
 Ensure your user is in the `dialout` group to access `/dev/ttyUSB0`:
