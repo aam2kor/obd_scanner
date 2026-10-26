@@ -147,14 +147,23 @@ dpdu_parse_result_t dpdu_parser_feed_byte(dpdu_rx_parser_t *parser, uint8_t byte
 size_t dpdu_encode_frame(const dpdu_frame_t *frame, uint8_t *out_buf, size_t out_max);
 
 /**
+ * @brief Callback type for emitting D-PDU events (ACK, RESULT, ERROR) to the host queue.
+ */
+typedef void (*dpdu_emit_evt_fn_t)(const dpdu_frame_t *evt);
+
+/**
  * @brief Initialize the VCI D-PDU state and default OBD-II ComParams.
  */
 void dpdu_engine_init(dpdu_vci_state_t *state);
 
 /**
- * @brief Process an incoming Host D-PDU command and populate the response/event frame.
+ * @brief Process an incoming Host D-PDU command and emit response/event frames.
  */
-void dpdu_engine_process_cmd(dpdu_vci_state_t *state, const dpdu_frame_t *cmd, dpdu_frame_t *rsp);
+void dpdu_engine_process_cmd(
+    dpdu_vci_state_t *state,
+    const dpdu_frame_t *cmd,
+    dpdu_emit_evt_fn_t emit_fn
+);
 
 #endif /* DPDU_PROTOCOL_H */
 

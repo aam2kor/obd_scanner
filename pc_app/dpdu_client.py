@@ -9,7 +9,7 @@ Implements the binary Lean D-PDU wire protocol (0xA5 SOF + 8-byte header + paylo
 from dataclasses import dataclass
 import struct
 import time
-from typing import Optional
+from typing import Optional, Tuple
 import serial
 
 # Wire Framing Constants
@@ -101,6 +101,13 @@ class DpduFrame:
         return body + struct.pack("<H", crc)
 
 
+@dataclass
+class DpduResultEvent:
+    rx_can_id: int
+    rx_time_ms: int
+    pdu: bytes
+
+
 class DpduStreamParser:
     """Byte-stream parser for 0xA5 binary D-PDU frames."""
 
@@ -164,8 +171,9 @@ class LeanDpduSerialClient:
     """PC Host Lean D-PDU Client communicating over USB-UART (or BLE in Step 4)."""
 
     def __init__(self, port: str = "/dev/ttyUSB0", baud: int = 115200):
-        self.ser = serial.Serial(port, baud, timeout=0.05)
+        self.ser = serial.Serial(port, baud, timeout=0.02)
         self.parser = DpduStreamParser()
+        self._rx_queue: list[DpduFrame] = []
         self._seq = 1
 
     def close(self):
@@ -182,11 +190,26 @@ class LeanDpduSerialClient:
         time.sleep(0.6)
         self.ser.reset_input_buffer()
         self.parser.reset()
+        self._rx_queue.clear()
 
     def _next_seq(self) -> int:
         s = self._seq
         self._seq = (self._seq + 1) & 0xFFFF
         return s
+
+    def recv_frame(self, timeout: float = 1.0) -> DpduFrame:
+        if self._rx_queue:
+            return self._rx_queue.pop(0)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            chunk = self.ser.read(128)
+            for b in chunk:
+                frame = self.parser.feed_byte(b)
+                if frame is not None:
+                    self._rx_queue.append(frame)
+            if self._rx_queue:
+                return self._rx_queue.pop(0)
+        raise TimeoutError("Timed out waiting for D-PDU frame from VCI")
 
     def send_and_recv(
         self,
@@ -201,15 +224,7 @@ class LeanDpduSerialClient:
         wire = req.encode(corrupt_crc=corrupt_crc)
         self.ser.write(wire)
         self.ser.flush()
-
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            chunk = self.ser.read(128)
-            for b in chunk:
-                frame = self.parser.feed_byte(b)
-                if frame is not None:
-                    return frame
-        raise TimeoutError(f"Timed out waiting for VCI response to opcode 0x{opcode:02x} (seq={seq})")
+        return self.recv_frame(timeout=timeout)
 
     def pdu_get_status(self) -> dict:
         rsp = self.send_and_recv(PDU_CMD_GET_STATUS)
@@ -246,64 +261,98 @@ class LeanDpduSerialClient:
         _, val = struct.unpack("<BI", rsp.payload[2:7])
         return val
 
-    def pdu_start_com_primitive(self, pdu_data: bytes, cop_type: int = PDU_COPT_SENDRECV, flags: int = 0) -> DpduFrame:
+    def pdu_start_com_primitive(
+        self,
+        pdu_data: bytes,
+        cop_type: int = PDU_COPT_SENDRECV,
+        flags: int = 0,
+        timeout: float = 2.0,
+    ) -> Tuple[DpduFrame, Optional[DpduFrame]]:
+        """
+        Send PDU_CMD_START_COP.
+        Returns (ack_frame, event_frame) where event_frame is PDU_EVT_RESULT or PDU_EVT_ERROR
+        for SENDRECV when connected.
+        """
         payload = struct.pack("<BB", cop_type, flags) + pdu_data
-        return self.send_and_recv(PDU_CMD_START_COP, payload)
+        ack = self.send_and_recv(PDU_CMD_START_COP, payload, timeout=timeout)
+        if ack.opcode != PDU_EVT_CMD_ACK or ack.payload[1] != PDU_STATUS_NOERROR:
+            return ack, None
+        if cop_type == PDU_COPT_SEND_ONLY:
+            return ack, None
+        evt = self.recv_frame(timeout=timeout)
+        return ack, evt
+
+    @staticmethod
+    def parse_result_event(evt: DpduFrame) -> DpduResultEvent:
+        assert evt.opcode == PDU_EVT_RESULT and len(evt.payload) >= 6
+        rx_can_id, rx_time_ms = struct.unpack("<IH", evt.payload[:6])
+        return DpduResultEvent(rx_can_id=rx_can_id, rx_time_ms=rx_time_ms, pdu=evt.payload[6:])
 
 
-def run_step1_verification():
-    print("=== Step 1 Hardware Verification: Binary Lean D-PDU Protocol Core ===")
+def run_step2_verification():
+    print("=== Step 2 Hardware Verification: CAN HAL + Single-Frame OBD-II Mode 01 + P2/P2* Timers ===")
     client = LeanDpduSerialClient("/dev/ttyUSB0", 115200)
     try:
-        print("[1/7] Resetting ESP32 VCI and querying initial PDU_CMD_GET_STATUS...")
+        print("[1/7] Resetting ESP32 VCI & connecting Logical Link (SimLoopback, 500 kbps)...")
         client.reset_vci_board()
-        st = client.pdu_get_status()
-        print(f"      Status OK: {st}")
-        assert st["connected"] is False
-        assert st["baud_khz"] == 500
-        assert st["can_req_id"] == 0x7DF
+        ack = client.pdu_connect(bus_mode=VCI_BUS_MODE_SIM_LOOPBACK, baud_khz=500)
+        assert ack.opcode == PDU_EVT_CMD_ACK and ack.payload[1] == PDU_STATUS_NOERROR
+        print("      Connected (CAN_REQ_ID=0x7DF, CAN_RESP_ID=0x7E8, P2_Max=50ms, P2*_Max=5000ms)")
 
-        print("[2/7] Verifying PDU_CMD_START_COP is rejected when disconnected...")
-        rsp = client.pdu_start_com_primitive(b"\x01\x0C")
-        assert rsp.opcode == PDU_EVT_CMD_ACK and rsp.payload[1] == PDU_STATUS_NOT_CONN
-        print("      Correctly returned PDU_STATUS_NOT_CONN (0x02)")
+        print("[2/7] Querying OBD-II Mode 01 PID 0x00 (Supported PIDs 01..20)...")
+        ack, evt = client.pdu_start_com_primitive(b"\x01\x00")
+        res = client.parse_result_event(evt)
+        print(f"      RX CAN ID=0x{res.rx_can_id:03X} ({res.rx_time_ms} ms) PDU={res.pdu.hex(' ').upper()}")
+        assert res.rx_can_id == 0x7E8 and res.pdu == bytes.fromhex("41 00 BE 3E B8 13")
 
-        print("[3/7] Connecting Logical Link via PDU_CMD_CONNECT (SimLoopback, 500 kbps)...")
-        rsp = client.pdu_connect(bus_mode=VCI_BUS_MODE_SIM_LOOPBACK, baud_khz=500)
-        assert rsp.opcode == PDU_EVT_CMD_ACK and rsp.payload[1] == PDU_STATUS_NOERROR
-        print("      Connected! GPIO 2 LED switched to 1 Hz Connected heartbeat.")
+        print("[3/7] Querying OBD-II Mode 01 PID 0x0C (Engine RPM)...")
+        ack, evt = client.pdu_start_com_primitive(b"\x01\x0C")
+        res = client.parse_result_event(evt)
+        rpm = ((res.pdu[2] << 8) | res.pdu[3]) / 4.0
+        print(f"      RX CAN ID=0x{res.rx_can_id:03X} ({res.rx_time_ms} ms) PDU={res.pdu.hex(' ').upper()} -> {rpm:.1f} RPM")
+        assert res.pdu[:2] == b"\x41\x0C" and rpm == 1726.0
 
-        print("[4/7] Setting & reading back ComParams (CP_CAN_PHYS_REQ_ID=0x7E0, CP_P2_MAX_MS=75)...")
-        rsp1 = client.pdu_set_com_param(CP_CAN_PHYS_REQ_ID, 0x000007E0)
-        rsp2 = client.pdu_set_com_param(CP_P2_MAX_MS, 75)
-        assert rsp1.payload[1] == PDU_STATUS_NOERROR and rsp2.payload[1] == PDU_STATUS_NOERROR
-        req_id = client.pdu_get_com_param(CP_CAN_PHYS_REQ_ID)
-        p2_max = client.pdu_get_com_param(CP_P2_MAX_MS)
-        print(f"      Read back: CP_CAN_PHYS_REQ_ID=0x{req_id:03X}, CP_P2_MAX_MS={p2_max} ms")
-        assert req_id == 0x7E0 and p2_max == 75
+        print("[4/7] Querying OBD-II Mode 01 PID 0x0D (Vehicle Speed) & PID 0x05 (Coolant Temp)...")
+        _, evt_spd = client.pdu_start_com_primitive(b"\x01\x0D")
+        res_spd = client.parse_result_event(evt_spd)
+        speed_kmh = res_spd.pdu[2]
 
-        print("[5/7] Starting ComPrimitive (SENDRECV [01 0C]) while connected...")
-        rsp = client.pdu_start_com_primitive(b"\x01\x0C")
-        assert rsp.opcode == PDU_EVT_CMD_ACK and rsp.payload[1] == PDU_STATUS_NOERROR
-        print("      ComPrimitive accepted (PDU_STATUS_NOERROR)")
+        _, evt_tmp = client.pdu_start_com_primitive(b"\x01\x05")
+        res_tmp = client.parse_result_event(evt_tmp)
+        coolant_c = res_tmp.pdu[2] - 40
+        print(f"      Speed   : {res_spd.pdu.hex(' ').upper()} -> {speed_kmh} km/h ({res_spd.rx_time_ms} ms)")
+        print(f"      Coolant : {res_tmp.pdu.hex(' ').upper()} -> {coolant_c} °C ({res_tmp.rx_time_ms} ms)")
+        assert speed_kmh == 85 and coolant_c == 90
 
-        print("[6/7] Injecting intentional 1-bit CRC-16 error to verify VCI CRC protection...")
-        err_rsp = client.send_and_recv(PDU_CMD_GET_STATUS, corrupt_crc=True)
-        assert err_rsp.opcode == PDU_EVT_ERROR and err_rsp.payload[0] == PDU_ERR_CRC_MISMATCH
-        print(f"      VCI detected corrupted frame and returned PDU_EVT_ERROR (err=0x{err_rsp.payload[0]:02x} CRC_MISMATCH)")
+        print("[5/7] Querying OBD-II Mode 01 PID 0x11 (Throttle Position)...")
+        _, evt_thr = client.pdu_start_com_primitive(b"\x01\x11")
+        res_thr = client.parse_result_event(evt_thr)
+        throttle_pct = (res_thr.pdu[2] * 100.0) / 255.0
+        print(f"      Throttle: {res_thr.pdu.hex(' ').upper()} -> {throttle_pct:.1f}% ({res_thr.rx_time_ms} ms)")
+        assert res_thr.pdu == b"\x41\x11\x40"
 
-        print("[7/7] Querying final status & disconnecting via PDU_CMD_DISCONNECT...")
-        st_final = client.pdu_get_status()
-        print(f"      Final VCI Status: {st_final}")
-        assert st_final["connected"] is True
-        assert st_final["crc_err_count"] == 1
-        disc_rsp = client.pdu_disconnect()
-        assert disc_rsp.opcode == PDU_EVT_CMD_ACK and disc_rsp.payload[1] == PDU_STATUS_NOERROR
-        print("=== ALL 7 STEP 1 HARDWARE CHECKS PASSED! ===")
+        print("[6/7] Testing UDS/OBD Negative Response 0x7F 0x01 0x78 (ResponsePending) -> P2* Timer Extension...")
+        _, evt_p2star = client.pdu_start_com_primitive(b"\x01\xF0")
+        res_p2star = client.parse_result_event(evt_p2star)
+        print(
+            f"      NRC 0x78 absorbed by VCI! Final positive response received at {res_p2star.rx_time_ms} ms "
+            f"(> 50ms P2_Max): {res_p2star.pdu.hex(' ').upper()}"
+        )
+        assert res_p2star.pdu == b"\x41\xF0\xAB\xCD" and res_p2star.rx_time_ms >= 100
+
+        print("[7/7] Testing P2_Max (50 ms) Timeout on unanswered PID (01 FF)...")
+        _, evt_to = client.pdu_start_com_primitive(b"\x01\xFF")
+        assert evt_to.opcode == PDU_EVT_ERROR and evt_to.payload[0] == PDU_ERR_P2_TIMEOUT
+        print(
+            f"      VCI enforced P2_Max timeout and emitted PDU_EVT_ERROR "
+            f"(err=0x{evt_to.payload[0]:02x} PDU_ERR_P2_TIMEOUT, sid=0x{evt_to.payload[1]:02x})"
+        )
+
+        client.pdu_disconnect()
+        print("=== ALL 7 STEP 2 HARDWARE CHECKS PASSED! ===")
     finally:
         client.close()
 
 
 if __name__ == "__main__":
-    run_step1_verification()
-
+    run_step2_verification()

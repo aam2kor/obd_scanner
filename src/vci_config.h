@@ -27,8 +27,8 @@
 /* FreeRTOS Task Priorities */
 #define VCI_PRIO_LED_TASK       3
 #define VCI_PRIO_HOST_IO_TASK   10
-#define VCI_PRIO_ECU_SIM_TASK   12
 #define VCI_PRIO_VCI_RT_TASK    18
+#define VCI_PRIO_ECU_SIM_TASK   19
 
 /* Queue Depths */
 #define VCI_CMD_QUEUE_DEPTH     8

@@ -1,9 +1,9 @@
 /**
  * @file main.c
- * @brief ESP32 OBD-II VCI — Step 1: Dual-Core FreeRTOS & Binary Lean D-PDU Engine.
+ * @brief ESP32 OBD-II VCI — Step 2: CAN HAL (TWAI + Virtual ECU), Single-Frame ISO-TP & P2/P2* Timers.
  *
  * Core 0 (PRO_CPU): Host I/O Task (UART0 / BLE binary frame parser & transmitter) + Status LED
- * Core 1 (APP_CPU): Real-Time VCI Task (Lean D-PDU Command & ComParam Engine)
+ * Core 1 (APP_CPU): Real-Time VCI Task (Lean D-PDU + ISO-TP + CAN HAL) + Virtual ECU Task
  */
 
 #include <stdio.h>
@@ -17,6 +17,8 @@
 #include "vci_config.h"
 #include "led_status.h"
 #include "dpdu_protocol.h"
+#include "can_hal.h"
+#include "ecu_sim.h"
 
 static const char *TAG = "vci_main";
 
@@ -36,6 +38,13 @@ static void host_uart_send_frame(const dpdu_frame_t *frame)
     }
 }
 
+static void vci_emit_evt(const dpdu_frame_t *evt)
+{
+    if (s_q_dpdu_evt != NULL && evt != NULL) {
+        xQueueSend(s_q_dpdu_evt, evt, pdMS_TO_TICKS(100));
+    }
+}
+
 /**
  * @brief Core 0 Task: Reads raw bytes from Host (UART0), runs the 0xA5 + CRC-16
  *        stream parser, forwards valid commands to Core 1 via s_q_dpdu_cmd, and
@@ -51,12 +60,11 @@ static void host_io_task(void *arg)
     dpdu_parser_init(&parser);
 
     while (1) {
-        /* 1. Read incoming bytes from Host UART (up to 10ms wait) */
         int rx_len = uart_read_bytes(
             VCI_HOST_UART_NUM,
             rx_chunk,
             sizeof(rx_chunk),
-            pdMS_TO_TICKS(10)
+            pdMS_TO_TICKS(5)
         );
 
         for (int i = 0; i < rx_len; i++) {
@@ -85,7 +93,6 @@ static void host_io_task(void *arg)
             }
         }
 
-        /* 2. Drain any outgoing VCI events queued by Core 1 */
         while (xQueueReceive(s_q_dpdu_evt, &evt_frame, 0) == pdTRUE) {
             host_uart_send_frame(&evt_frame);
         }
@@ -93,19 +100,16 @@ static void host_io_task(void *arg)
 }
 
 /**
- * @brief Core 1 Task: Real-time VCI engine processing D-PDU commands and ComParams.
+ * @brief Core 1 Task: Real-time VCI engine processing D-PDU commands, ISO-TP, and P2/P2* timers.
  */
 static void vci_rt_task(void *arg)
 {
     (void)arg;
     static dpdu_frame_t cmd_frame;
-    static dpdu_frame_t rsp_frame;
 
     while (1) {
         if (xQueueReceive(s_q_dpdu_cmd, &cmd_frame, pdMS_TO_TICKS(10)) == pdTRUE) {
-            memset(&rsp_frame, 0, sizeof(rsp_frame));
-            dpdu_engine_process_cmd(&s_vci_state, &cmd_frame, &rsp_frame);
-            xQueueSend(s_q_dpdu_evt, &rsp_frame, pdMS_TO_TICKS(50));
+            dpdu_engine_process_cmd(&s_vci_state, &cmd_frame, vci_emit_evt);
         }
     }
 }
@@ -133,9 +137,11 @@ static void host_uart_init(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting ESP32 OBD-II VCI (Step 1: Lean D-PDU Core)...");
+    ESP_LOGI(TAG, "Starting ESP32 OBD-II VCI (Step 2: CAN HAL + Single-Frame ISO-TP + P2/P2*)...");
 
     dpdu_engine_init(&s_vci_state);
+    can_hal_init();
+    ecu_sim_init();
     led_status_init();
     host_uart_init();
 
@@ -163,5 +169,5 @@ void app_main(void)
         VCI_CORE_HOST_IO
     );
 
-    ESP_LOGI(TAG, "VCI Ready on UART0 (%d baud) — Waiting for binary 0xA5 D-PDU frames.", VCI_HOST_UART_BAUD);
+    ESP_LOGI(TAG, "VCI Ready on UART0 (%d baud).", VCI_HOST_UART_BAUD);
 }

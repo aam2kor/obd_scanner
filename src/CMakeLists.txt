@@ -3,6 +3,9 @@ idf_component_register(
         "main.c"
         "led_status.c"
         "dpdu_protocol.c"
+        "can_hal.c"
+        "ecu_sim.c"
+        "isotp.c"
     INCLUDE_DIRS
         "."
 )
