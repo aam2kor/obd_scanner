@@ -284,7 +284,10 @@ class LeanDpduSerialClient:
 
     @staticmethod
     def parse_result_event(evt: DpduFrame) -> DpduResultEvent:
-        assert evt.opcode == PDU_EVT_RESULT and len(evt.payload) >= 6
+        if evt.opcode != PDU_EVT_RESULT or len(evt.payload) < 6:
+            raise AssertionError(
+                f"Expected PDU_EVT_RESULT (0x81), got opcode=0x{evt.opcode:02X} payload={evt.payload.hex(' ')}"
+            )
         rx_can_id, rx_time_ms = struct.unpack("<IH", evt.payload[:6])
         return DpduResultEvent(rx_can_id=rx_can_id, rx_time_ms=rx_time_ms, pdu=evt.payload[6:])
 
@@ -354,5 +357,122 @@ def run_step2_verification():
         client.close()
 
 
+def decode_obd_dtcs(pdu: bytes) -> list[str]:
+    """Decode SAE J1979 Mode 03 response [0x43, count, hi1, lo1, ...] into standard DTC strings."""
+    assert len(pdu) >= 2 and pdu[0] == 0x43
+    count = pdu[1]
+    prefix_map = {0: "P", 1: "C", 2: "B", 3: "U"}
+    dtcs: list[str] = []
+    for i in range(count):
+        idx = 2 + (i * 2)
+        if idx + 1 >= len(pdu):
+            break
+        b1, b2 = pdu[idx], pdu[idx + 1]
+        if b1 == 0 and b2 == 0:
+            continue
+        sys_prefix = prefix_map[(b1 >> 6) & 0x03]
+        d1 = (b1 >> 4) & 0x03
+        d2 = b1 & 0x0F
+        d3 = (b2 >> 4) & 0x0F
+        d4 = b2 & 0x0F
+        dtcs.append(f"{sys_prefix}{d1:X}{d2:X}{d3:X}{d4:X}")
+    return dtcs
+
+
+def run_step3_verification():
+    print("=== Step 3 Hardware Verification: Multi-Frame ISO 15765-2 (FF/FC/CF) for VIN, DTCs & UDS ===")
+    client = LeanDpduSerialClient("/dev/ttyUSB0", 115200)
+    try:
+        print("[1/8] Resetting ESP32 VCI & connecting Logical Link (SimLoopback, 500 kbps)...")
+        client.reset_vci_board()
+        ack = client.pdu_connect(bus_mode=VCI_BUS_MODE_SIM_LOOPBACK, baud_khz=500)
+        assert ack.opcode == PDU_EVT_CMD_ACK and ack.payload[1] == PDU_STATUS_NOERROR
+        print("      Connected (ISO-TP BS=0, STmin=0ms, N_Cr=1000ms)")
+
+        print("[2/8] Querying OBD-II Mode 09 PID 0x02 (17-Char VIN via Multi-Frame FF/FC/CF)...")
+        _, evt_vin = client.pdu_start_com_primitive(b"\x09\x02")
+        res_vin = client.parse_result_event(evt_vin)
+        vin_str = res_vin.pdu[3:].decode("ascii")
+        print(
+            f"      RX CAN ID=0x{res_vin.rx_can_id:03X} ({res_vin.rx_time_ms} ms, {len(res_vin.pdu)} bytes) "
+            f"VIN='{vin_str}'"
+        )
+        assert len(res_vin.pdu) == 20 and res_vin.pdu[:3] == b"\x49\x02\x01"
+        assert vin_str == "1FAFP40411F192837"
+
+        print("[3/8] Testing Flow Control BlockSize (BS=1) & STmin (10 ms) on Mode 09 PID 0x04 (Cal ID)...")
+        client.pdu_set_com_param(CP_ISOTP_BS, 1)
+        client.pdu_set_com_param(CP_ISOTP_STMIN_MS, 10)
+        _, evt_cal = client.pdu_start_com_primitive(b"\x09\x04")
+        res_cal = client.parse_result_event(evt_cal)
+        cal_str = res_cal.pdu[3:].decode("ascii")
+        print(
+            f"      RX CAN ID=0x{res_cal.rx_can_id:03X} ({res_cal.rx_time_ms} ms, {len(res_cal.pdu)} bytes) "
+            f"CalID='{cal_str}' (with BS=1 & STmin=10ms >= 20ms)"
+        )
+        assert cal_str == "ESP32_VCI_CAL_01" and res_cal.rx_time_ms >= 20
+        client.pdu_set_com_param(CP_ISOTP_BS, 0)
+        client.pdu_set_com_param(CP_ISOTP_STMIN_MS, 0)
+
+        print("[4/8] Querying OBD-II Mode 03 (Read Stored Diagnostic Trouble Codes via Multi-Frame)...")
+        _, evt_dtc = client.pdu_start_com_primitive(b"\x03")
+        res_dtc = client.parse_result_event(evt_dtc)
+        dtcs = decode_obd_dtcs(res_dtc.pdu)
+        print(f"      RX PDU={res_dtc.pdu.hex(' ').upper()} ({len(res_dtc.pdu)} bytes) -> Stored DTCs: {dtcs}")
+        assert dtcs == ["P0171", "P0300", "C0035", "U0100"]
+
+        print("[5/8] Executing OBD-II Mode 04 (Clear DTCs) and re-querying Mode 03...")
+        _, evt_clr = client.pdu_start_com_primitive(b"\x04")
+        res_clr = client.parse_result_event(evt_clr)
+        assert res_clr.pdu == b"\x44"
+        _, evt_dtc_after = client.pdu_start_com_primitive(b"\x03")
+        res_dtc_after = client.parse_result_event(evt_dtc_after)
+        dtcs_after = decode_obd_dtcs(res_dtc_after.pdu)
+        print(f"      Mode 04 ACK={res_clr.pdu.hex().upper()}, Mode 03 after clear -> DTCs: {dtcs_after}")
+        assert dtcs_after == []
+
+        print("[6/8] Testing Multi-Frame TX (Tester VCI -> ECU): UDS 0x2E WriteDataByIdentifier (VIN)...")
+        new_vin = b"WBA3A5C51DF123456"
+        uds_req = b"\x2E\xF1\x90" + new_vin  # 20-byte Multi-Frame request!
+        _, evt_2e = client.pdu_start_com_primitive(uds_req)
+        res_2e = client.parse_result_event(evt_2e)
+        assert res_2e.pdu == b"\x6E\xF1\x90"
+        _, evt_vin2 = client.pdu_start_com_primitive(b"\x09\x02")
+        res_vin2 = client.parse_result_event(evt_vin2)
+        updated_vin = res_vin2.pdu[3:].decode("ascii")
+        print(
+            f"      UDS 0x2E Positive Rsp={res_2e.pdu.hex(' ').upper()}, "
+            f"Readback Mode 09 PID 0x02 VIN='{updated_vin}'"
+        )
+        assert updated_vin == "WBA3A5C51DF123456"
+
+        print("[7/8] Testing Multi-Frame Sequence Number Mismatch Detection (09 F2)...")
+        _, evt_seq = client.pdu_start_com_primitive(b"\x09\xF2")
+        assert evt_seq.opcode == PDU_EVT_ERROR and evt_seq.payload[0] == PDU_ERR_MALFORMED_FRAME
+        print(
+            f"      VCI detected bad CF sequence number and emitted PDU_EVT_ERROR "
+            f"(err=0x{evt_seq.payload[0]:02x} PDU_ERR_MALFORMED_FRAME)"
+        )
+
+        print("[8/8] Testing Multi-Frame N_Cr (1000 ms) Consecutive Frame Timeout (09 F1)...")
+        t0 = time.time()
+        _, evt_ncr = client.pdu_start_com_primitive(b"\x09\xF1", timeout=2.5)
+        elapsed_ms = int((time.time() - t0) * 1000)
+        assert evt_ncr.opcode == PDU_EVT_ERROR and evt_ncr.payload[0] == PDU_ERR_ISOTP_TIMEOUT
+        print(
+            f"      VCI enforced N_Cr (1000 ms) timeout at {elapsed_ms} ms and emitted PDU_EVT_ERROR "
+            f"(err=0x{evt_ncr.payload[0]:02x} PDU_ERR_ISOTP_TIMEOUT)"
+        )
+
+        client.pdu_disconnect()
+        print("=== ALL 8 STEP 3 HARDWARE CHECKS PASSED! ===")
+    finally:
+        client.close()
+
+
 if __name__ == "__main__":
-    run_step2_verification()
+    import sys
+    if "--all" in sys.argv:
+        run_step2_verification()
+        print()
+    run_step3_verification()

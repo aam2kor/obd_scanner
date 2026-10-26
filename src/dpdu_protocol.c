@@ -256,9 +256,10 @@ static void execute_start_cop(
 
     /* 2. Transmit PDU over ISO-TP / CAN HAL */
     int64_t t_start_us = esp_timer_get_time();
-    esp_err_t tx_err = isotp_send_pdu(state->can_req_id, pdu_req, pdu_req_len);
+    esp_err_t tx_err = isotp_send_pdu(state->can_req_id, state->can_resp_id, pdu_req, pdu_req_len);
     if (tx_err != ESP_OK) {
-        emit_error(emit_fn, cmd, PDU_ERR_CAN_BUS_OFF, (uint8_t)tx_err);
+        uint8_t err_code = (tx_err == ESP_ERR_TIMEOUT) ? PDU_ERR_ISOTP_TIMEOUT : PDU_ERR_CAN_BUS_OFF;
+        emit_error(emit_fn, cmd, err_code, (uint8_t)tx_err);
         return;
     }
 
@@ -266,11 +267,12 @@ static void execute_start_cop(
         return;
     }
 
-    /* 3. Wait for ECU response within P2_Max (or P2*_Max on NRC 0x78 ResponsePending) */
+    /* 3. Wait for ECU response within P2_Max (or P2*_Max on NRC 0x78, or N_Cr during Multi-Frame) */
     uint8_t req_sid = pdu_req[0];
     int64_t deadline_us = esp_timer_get_time() + ((int64_t)state->p2_max_ms * 1000LL);
     vci_can_frame_t rx_frame;
-    static isotp_rx_pdu_t rx_pdu;
+    static isotp_rx_ctx_t rx_ctx;
+    isotp_rx_init(&rx_ctx);
 
     while (esp_timer_get_time() < deadline_us) {
         int64_t rem_us = deadline_us - esp_timer_get_time();
@@ -282,27 +284,47 @@ static void execute_start_cop(
         }
 
         if (can_hal_recv(&rx_frame, wait_ms) == ESP_OK) {
-            if (isotp_on_can_frame(&rx_frame, state->can_resp_id, state->can_req_id, &rx_pdu)) {
+            isotp_rx_status_t st = isotp_rx_feed_frame(
+                &rx_ctx,
+                &rx_frame,
+                state->can_resp_id,
+                state->can_req_id,
+                (uint8_t)state->isotp_bs,
+                (uint8_t)state->isotp_stmin_ms
+            );
+
+            if (st == ISOTP_RX_IN_PROGRESS) {
+                /* Multi-Frame FF or intermediate CF received; reset deadline to N_Cr (1000 ms) */
+                deadline_us = esp_timer_get_time() + ((int64_t)ISOTP_N_CR_TIMEOUT_MS * 1000LL);
+            } else if (st == ISOTP_RX_COMPLETE) {
                 /* Check for UDS/OBD Negative Response 0x7F [SID] 0x78 (ResponsePending) */
-                if (rx_pdu.pdu_len >= 3U &&
-                    rx_pdu.pdu[0] == 0x7FU &&
-                    rx_pdu.pdu[1] == req_sid &&
-                    rx_pdu.pdu[2] == 0x78U) {
-                    /* Extend timeout to P2*_Max (5000ms default) */
+                if (rx_ctx.total_len >= 3U &&
+                    rx_ctx.pdu[0] == 0x7FU &&
+                    rx_ctx.pdu[1] == req_sid &&
+                    rx_ctx.pdu[2] == 0x78U) {
+                    /* Extend timeout to P2*_Max (5000ms default) and re-arm ISO-TP RX */
+                    isotp_rx_init(&rx_ctx);
                     deadline_us = esp_timer_get_time() + ((int64_t)state->p2_star_ms * 1000LL);
                     continue;
                 }
 
                 uint16_t elapsed_ms = (uint16_t)((esp_timer_get_time() - t_start_us) / 1000LL);
                 led_status_pulse_activity();
-                emit_result(emit_fn, cmd, rx_pdu.rx_can_id, elapsed_ms, rx_pdu.pdu, rx_pdu.pdu_len);
+                emit_result(emit_fn, cmd, rx_ctx.rx_can_id, elapsed_ms, rx_ctx.pdu, rx_ctx.total_len);
+                return;
+            } else if (st == ISOTP_RX_ERR_SEQ || st == ISOTP_RX_ERR_OVERFLOW || st == ISOTP_RX_ERR_FC_TX) {
+                emit_error(emit_fn, cmd, PDU_ERR_MALFORMED_FRAME, (uint8_t)st);
                 return;
             }
         }
     }
 
-    /* P2 / P2* Timeout expired */
-    emit_error(emit_fn, cmd, PDU_ERR_P2_TIMEOUT, req_sid);
+    /* Timeout expired: distinguish Multi-Frame N_Cr timeout from initial P2/P2* timeout */
+    if (rx_ctx.in_progress) {
+        emit_error(emit_fn, cmd, PDU_ERR_ISOTP_TIMEOUT, req_sid);
+    } else {
+        emit_error(emit_fn, cmd, PDU_ERR_P2_TIMEOUT, req_sid);
+    }
 }
 
 void dpdu_engine_process_cmd(
