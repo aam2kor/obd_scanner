@@ -6,6 +6,7 @@ idf_component_register(
         "can_hal.c"
         "ecu_sim.c"
         "isotp.c"
+        "ble_nus.c"
     INCLUDE_DIRS
         "."
 )

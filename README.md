@@ -81,24 +81,37 @@ max tx power=78,ret=0
 
 ## Development Environment (PlatformIO + ESP-IDF in C)
 
-This project uses **PlatformIO** with the official **ESP-IDF** C framework (`framework = espidf`), targeting the ESP32's built-in FreeRTOS kernel, GPIO drivers (`driver/gpio.h`), and Two-Wire Automotive Interface CAN controller (`driver/twai.h`).
+This project implements a dual-core **ESP32 OBD-II Vehicle Communication Interface (VCI)** in C (`framework = espidf`) and a **PC Bluetooth LE & Serial OBD-II Scanner Application** (`pc_app/`) communicating over a **Binary Lean D-PDU API (ISO 22900-2 subset)**.
 
-### Project Structure
-- `platformio.ini` — PlatformIO configuration (`board = esp32dev`, `framework = espidf`)
-- `CMakeLists.txt` & `src/CMakeLists.txt` — ESP-IDF CMake build definitions
-- `src/main.c` — Pure C application entry point (`app_main`)
+### 4-Layer VCI Firmware Architecture (`src/`)
+- **Core 0 (`PRO_CPU`) — Host Transport & Status:**
+  - `src/ble_nus.h` / `src/ble_nus.c` — Bluetooth LE Nordic UART Service (`ESP32-OBD-VCI`, Service UUID `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`) via ESP-IDF NimBLE
+  - `src/main.c` — Dual-transport Host I/O task (UART0 + BLE NUS) and FreeRTOS queue routing
+  - `src/led_status.h` / `src/led_status.c` — Non-blocking status LED state machine on `GPIO 2`
+- **Core 1 (`APP_CPU`) — Hard Real-Time Automotive Stack:**
+  - `src/dpdu_protocol.h` / `src/dpdu_protocol.c` — Binary Lean D-PDU (`0xA5` SOF + 8B Header + Payload + CRC-16/CCITT-FALSE), ComParam engine, and `P2_Max` (`50 ms`) / `P2*_Max` (`5000 ms` on NRC `0x78`) timers
+  - `src/isotp.h` / `src/isotp.c` — Bidirectional ISO 15765-2 (ISO-TP) Single-Frame (`SF`) and Multi-Frame (`FF` / `FC` / `CF`) segmentation & reassembly (`N_Bs = 1000 ms`, `N_Cr = 1000 ms`)
+  - `src/can_hal.h` / `src/can_hal.c` — CAN Classic 2.0B HAL (`driver/twai.h` on `GPIO 21` TX / `GPIO 22` RX + Virtual Loopback mode)
+  - `src/ecu_sim.h` / `src/ecu_sim.c` — Virtual OBD-II / UDS ECU simulator (Modes `01`, `03`, `04`, `09` 17-char VIN & Cal ID, UDS `0x2E`)
 
-### Build, Flash, and Serial Monitor Commands
+### PC OBD-II Diagnostic Scanner (`pc_app/`)
+- `pc_app/dpdu_client.py` — Binary Lean D-PDU serial client & automated hardware verification suites (Steps 1–3)
+- `pc_app/obd_scanner_app.py` — Bluetooth LE (`bleak` GATT NUS) & Serial OBD-II Scanner CLI and Step 4 BLE verification suite
+
+### Build, Flash, and Run Commands
 
 ```bash
-# Build the C firmware
+# Build the ESP-IDF C firmware
 .venv/bin/pio run
 
-# Build and flash to /dev/ttyUSB0 (writes bootloader.bin @ 0x1000, partitions.bin @ 0x8000, firmware.bin @ 0x10000)
-.venv/bin/pio run -t upload
+# Run Step 2 & Step 3 USB-UART D-PDU & ISO-TP hardware verification
+.venv/bin/python pc_app/dpdu_client.py --all
 
-# Open the 115200 baud serial monitor
-.venv/bin/pio device monitor
+# Run Step 4 Bluetooth LE (NimBLE NUS) end-to-end hardware verification
+.venv/bin/python pc_app/obd_scanner_app.py --verify-ble
+
+# Launch interactive Bluetooth LE OBD-II Scanner CLI
+.venv/bin/python pc_app/obd_scanner_app.py
 ```
 
 ---
