@@ -46,14 +46,30 @@ PDU_ERR_ISOTP_TIMEOUT   = 0x02
 PDU_ERR_CAN_BUS_OFF     = 0x03
 PDU_ERR_CRC_MISMATCH    = 0x04
 PDU_ERR_MALFORMED_FRAME = 0x05
+PDU_ERR_CANCELLED       = 0x06
 
-# ComParam IDs
-CP_CAN_PHYS_REQ_ID  = 0x01
-CP_CAN_RESP_USDT_ID = 0x02
-CP_P2_MAX_MS        = 0x03
-CP_P2_STAR_MS       = 0x04
-CP_ISOTP_BS         = 0x05
-CP_ISOTP_STMIN_MS   = 0x06
+# 13 ISO 22900-2 Aligned ComParam IDs
+CP_BAUDRATE         = 0x01
+CP_CAN_PHYS_REQ_ID  = 0x02
+CP_CAN_RESP_USDT_ID = 0x03
+CP_ADDRESSING_TYPE  = 0x04
+CP_CAN_FILLER_BYTE  = 0x05
+CP_BLOCK_SIZE       = 0x06
+CP_ST_MIN           = 0x07
+CP_N_BS_MS          = 0x08
+CP_N_CR_MS          = 0x09
+CP_P2_MAX_MS        = 0x0A
+CP_P2_STAR_MS       = 0x0B
+CP_P3_PHYS_MS       = 0x0C
+CP_P3_FUNC_MS       = 0x0D
+
+# Backwards-compatible aliases
+CP_ISOTP_BS         = CP_BLOCK_SIZE
+CP_ISOTP_STMIN_MS   = CP_ST_MIN
+
+# Addressing Types (CP_ADDRESSING_TYPE)
+DPDU_ADDR_FUNCTIONAL = 0x00
+DPDU_ADDR_PHYSICAL   = 0x01
 
 # Bus Modes
 VCI_BUS_MODE_SIM_LOOPBACK = 0x00
@@ -181,13 +197,13 @@ class LeanDpduSerialClient:
             self.ser.close()
 
     def reset_vci_board(self):
-        """Hardware reset the ESP32 via RTS and wait for VCI initialization."""
+        """Hardware reset the ESP32 via RTS and wait for VCI + BLE initialization."""
         self.ser.dtr = False
         self.ser.rts = True
         time.sleep(0.1)
         self.ser.reset_input_buffer()
         self.ser.rts = False
-        time.sleep(0.6)
+        time.sleep(1.0)
         self.ser.reset_input_buffer()
         self.parser.reset()
         self._rx_queue.clear()
@@ -244,8 +260,11 @@ class LeanDpduSerialClient:
             "can_req_id": req_id,
         }
 
-    def pdu_connect(self, bus_mode: int = VCI_BUS_MODE_SIM_LOOPBACK, baud_khz: int = 500, flags: int = 0) -> DpduFrame:
-        payload = struct.pack("<BHB", bus_mode, baud_khz, flags)
+    def pdu_connect(self, bus_mode: int = VCI_BUS_MODE_SIM_LOOPBACK, baud_khz: int = 0, flags: int = 0) -> DpduFrame:
+        if baud_khz == 0 and flags == 0:
+            payload = struct.pack("<B", bus_mode)
+        else:
+            payload = struct.pack("<BHB", bus_mode, baud_khz, flags)
         return self.send_and_recv(PDU_CMD_CONNECT, payload)
 
     def pdu_disconnect(self) -> DpduFrame:
@@ -470,9 +489,120 @@ def run_step3_verification():
         client.close()
 
 
+def run_comparam_and_standards_verification():
+    print("=== ISO 22900-2 Standards Verification: 13 ComParams, P3_Func/P3_Phys, 29-Bit CAN & Cancel ===")
+    client = LeanDpduSerialClient("/dev/ttyUSB0", 115200)
+    try:
+        print("[1/6] Resetting VCI & verifying all 13 default ISO 22900-2 ComParams...")
+        client.reset_vci_board()
+        expected_defaults = {
+            CP_BAUDRATE:         500000,
+            CP_CAN_PHYS_REQ_ID:  0x7DF,
+            CP_CAN_RESP_USDT_ID: 0x7E8,
+            CP_ADDRESSING_TYPE:  DPDU_ADDR_FUNCTIONAL,
+            CP_CAN_FILLER_BYTE:  0xCC,
+            CP_BLOCK_SIZE:       0,
+            CP_ST_MIN:           0,
+            CP_N_BS_MS:          1000,
+            CP_N_CR_MS:          1000,
+            CP_P2_MAX_MS:        50,
+            CP_P2_STAR_MS:       5000,
+            CP_P3_PHYS_MS:       5,
+            CP_P3_FUNC_MS:       50,
+        }
+        for cp_id, exp_val in expected_defaults.items():
+            actual = client.pdu_get_com_param(cp_id)
+            assert actual == exp_val, f"ComParam 0x{cp_id:02X} mismatch: {actual} != {exp_val}"
+        print("      All 13 ComParams verified at standard defaults!")
+
+        print("[2/6] Setting CP_BAUDRATE = 250000 bps before PDUConnect(bus_mode)...")
+        client.pdu_set_com_param(CP_BAUDRATE, 250000)
+        ack = client.pdu_connect(bus_mode=VCI_BUS_MODE_SIM_LOOPBACK)
+        assert ack.opcode == PDU_EVT_CMD_ACK and ack.payload[1] == PDU_STATUS_NOERROR
+        st = client.pdu_get_status()
+        print(f"      Connected via CP_BAUDRATE -> Active Bus Baud = {st['baud_khz']} kbps")
+        assert st["baud_khz"] == 250
+
+        print("[3/6] Verifying CP_CAN_FILLER_BYTE (0xAA and 0x55) on outgoing CAN frames (01 F3)...")
+        client.pdu_set_com_param(CP_CAN_FILLER_BYTE, 0xAA)
+        _, evt_pad1 = client.pdu_start_com_primitive(b"\x01\xF3")
+        res_pad1 = client.parse_result_event(evt_pad1)
+        client.pdu_set_com_param(CP_CAN_FILLER_BYTE, 0x55)
+        _, evt_pad2 = client.pdu_start_com_primitive(b"\x01\xF3")
+        res_pad2 = client.parse_result_event(evt_pad2)
+        print(
+            f"      Filler=0xAA -> ECU saw 0x{res_pad1.pdu[2]:02X}; "
+            f"Filler=0x55 -> ECU saw 0x{res_pad2.pdu[2]:02X}"
+        )
+        assert res_pad1.pdu[2] == 0xAA and res_pad2.pdu[2] == 0x55
+        client.pdu_set_com_param(CP_CAN_FILLER_BYTE, 0xCC)
+
+        print("[4/6] Verifying CP_P3_FUNC_MS (100 ms) vs CP_P3_PHYS_MS (5 ms) Inter-Request Enforcement...")
+        client.pdu_set_com_param(CP_ADDRESSING_TYPE, DPDU_ADDR_FUNCTIONAL)
+        client.pdu_set_com_param(CP_P3_FUNC_MS, 100)
+        t0 = time.time()
+        client.pdu_start_com_primitive(b"\x01\x0C")
+        client.pdu_start_com_primitive(b"\x01\x0D")
+        func_pair_ms = int((time.time() - t0) * 1000)
+
+        client.pdu_set_com_param(CP_ADDRESSING_TYPE, DPDU_ADDR_PHYSICAL)
+        client.pdu_set_com_param(CP_CAN_PHYS_REQ_ID, 0x7E0)
+        client.pdu_set_com_param(CP_P3_PHYS_MS, 5)
+        time.sleep(0.11)  # Let previous Functional P3_Func window expire before timing Physical pair
+        t1 = time.time()
+        client.pdu_start_com_primitive(b"\x01\x0C")
+        client.pdu_start_com_primitive(b"\x01\x0D")
+        phys_pair_ms = int((time.time() - t1) * 1000)
+        print(
+            f"      Back-to-back Functional pair (CP_P3_FUNC_MS=100ms): {func_pair_ms} ms (>= 100 ms)\n"
+            f"      Back-to-back Physical pair   (CP_P3_PHYS_MS=5ms)  : {phys_pair_ms} ms (< 70 ms)"
+        )
+        assert func_pair_ms >= 100 and phys_pair_ms < 70
+
+        print("[5/6] Verifying 29-Bit Extended OBD-II CAN (0x18DB33F1 -> 0x18DAF110) SF & Multi-Frame VIN...")
+        client.pdu_set_com_param(CP_ADDRESSING_TYPE, DPDU_ADDR_FUNCTIONAL)
+        client.pdu_set_com_param(CP_CAN_PHYS_REQ_ID, 0x18DB33F1)
+        client.pdu_set_com_param(CP_CAN_RESP_USDT_ID, 0x18DAF110)
+        client.pdu_set_com_param(CP_P3_FUNC_MS, 10)
+        _, evt_29_sf = client.pdu_start_com_primitive(b"\x01\x0C")
+        res_29_sf = client.parse_result_event(evt_29_sf)
+        _, evt_29_mf = client.pdu_start_com_primitive(b"\x09\x02")
+        res_29_mf = client.parse_result_event(evt_29_mf)
+        vin_29 = res_29_mf.pdu[3:].decode("ascii")
+        print(
+            f"      29-Bit SF RX ID=0x{res_29_sf.rx_can_id:08X} PDU={res_29_sf.pdu.hex(' ').upper()}\n"
+            f"      29-Bit MF RX ID=0x{res_29_mf.rx_can_id:08X} VIN='{vin_29}' (FC routed to 0x18DA10F1)"
+        )
+        assert res_29_sf.rx_can_id == 0x18DAF110 and res_29_mf.rx_can_id == 0x18DAF110
+        assert len(vin_29) == 17
+
+        print("[6/6] Verifying In-Flight PDU_CMD_CANCEL_COP (0x05) during active P2* wait (01 F4)...")
+        client.pdu_set_com_param(CP_CAN_PHYS_REQ_ID, 0x7DF)
+        client.pdu_set_com_param(CP_CAN_RESP_USDT_ID, 0x7E8)
+        payload = struct.pack("<BB", PDU_COPT_SENDRECV, 0) + b"\x01\xF4"
+        ack_start = client.send_and_recv(PDU_CMD_START_COP, payload)
+        assert ack_start.opcode == PDU_EVT_CMD_ACK
+        time.sleep(0.05)  # Let ECU emit NRC 0x78 so VCI enters 5000ms P2* wait
+        t_cancel = time.time()
+        f1 = client.send_and_recv(PDU_CMD_CANCEL_COP)
+        f2 = client.recv_frame(timeout=1.0)
+        cancel_ms = int((time.time() - t_cancel) * 1000)
+        frames = [f1, f2]
+        assert any(f.opcode == PDU_EVT_CMD_ACK and f.payload[0] == PDU_CMD_CANCEL_COP for f in frames)
+        assert any(f.opcode == PDU_EVT_ERROR and f.payload[0] == PDU_ERR_CANCELLED for f in frames)
+        print(f"      Active P2* wait aborted in {cancel_ms} ms (<< 5000ms P2*) with PDU_ERR_CANCELLED!")
+
+        client.pdu_disconnect()
+        print("=== ALL 6 ISO 22900-2 STANDARDS VERIFICATION CHECKS PASSED! ===")
+    finally:
+        client.close()
+
+
 if __name__ == "__main__":
     import sys
     if "--all" in sys.argv:
         run_step2_verification()
         print()
-    run_step3_verification()
+        run_step3_verification()
+        print()
+    run_comparam_and_standards_verification()

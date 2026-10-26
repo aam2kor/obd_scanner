@@ -51,6 +51,19 @@ static void vci_emit_evt(const dpdu_frame_t *evt)
     }
 }
 
+static bool vci_check_cancel(dpdu_frame_t *out_cancel_cmd)
+{
+    dpdu_frame_t peek_frame;
+    if (s_q_dpdu_cmd != NULL && xQueuePeek(s_q_dpdu_cmd, &peek_frame, 0) == pdTRUE) {
+        if (peek_frame.opcode == PDU_CMD_CANCEL_COP) {
+            xQueueReceive(s_q_dpdu_cmd, out_cancel_cmd, 0);
+            s_vci_state.rx_cmd_count++;
+            return true;
+        }
+    }
+    return false;
+}
+
 /**
  * @brief Callback invoked on Core 0 when bytes arrive over BLE NUS RX Characteristic.
  */
@@ -178,6 +191,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Starting ESP32 OBD-II VCI (Step 4: BLE NimBLE NUS + USB-UART0 + ISO-TP)...");
 
     dpdu_engine_init(&s_vci_state);
+    dpdu_engine_set_cancel_checker(vci_check_cancel);
     dpdu_parser_init(&s_ble_parser);
     can_hal_init();
     ecu_sim_init();

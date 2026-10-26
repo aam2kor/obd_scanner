@@ -1,6 +1,6 @@
 /**
  * @file isotp.c
- * @brief Layer 3: ISO 15765-2 (ISO-TP) Transport Layer (Single-Frame & Multi-Frame FF/FC/CF).
+ * @brief Layer 3: ISO 15765-2 (ISO-TP) Transport Layer driven by D-PDU ComParams.
  */
 
 #include "isotp.h"
@@ -9,8 +9,6 @@
 #include "esp_timer.h"
 #include "esp_rom_sys.h"
 #include <string.h>
-
-#define ISOTP_PAD_BYTE          0xCCU
 
 #define ISOTP_PCI_SF            0x00U
 #define ISOTP_PCI_FF            0x01U
@@ -21,40 +19,60 @@
 #define ISOTP_FC_FS_WAIT        0x01U /* Wait */
 #define ISOTP_FC_FS_OVFLW       0x02U /* Overflow */
 
-static bool is_matching_resp_id(uint32_t rx_id, uint32_t expected_resp_id, uint32_t req_id)
+static bool is_matching_resp_id(uint32_t rx_id, const isotp_config_t *cfg)
 {
-    if (rx_id == expected_resp_id) {
+    if (rx_id == cfg->can_resp_id) {
         return true;
     }
-    /* For OBD-II functional broadcast (0x7DF), accept any standard ECU response (0x7E8..0x7EF) */
-    if (req_id == 0x7DFU && rx_id >= 0x7E8U && rx_id <= 0x7EFU) {
-        return true;
+
+    /* When CP_ADDRESSING_TYPE == FUNCTIONAL (0), accept standard 11-bit and 29-bit OBD-II ECU responses */
+    if (cfg->addressing_type == 0U) {
+        /* 11-bit functional broadcast (0x7DF) -> ECU responses 0x7E8..0x7EF */
+        if (cfg->can_req_id == 0x7DFU && rx_id >= 0x7E8U && rx_id <= 0x7EFU) {
+            return true;
+        }
+        /* 29-bit functional broadcast (0x18DB33F1) -> ECU responses 0x18DAF100..0x18DAF1FF */
+        if (cfg->can_req_id == 0x18DB33F1U && (rx_id & 0xFFFFFF00U) == 0x18DAF100U) {
+            return true;
+        }
     }
     return false;
 }
 
-static uint32_t derive_fc_tx_can_id(uint32_t rx_resp_id, uint32_t req_id)
+static uint32_t derive_fc_tx_can_id(uint32_t rx_resp_id, const isotp_config_t *cfg)
 {
-    /* Per ISO 15765-4, if request was functional (0x7DF) and response came from 0x7E8..0x7EF,
-     * the physical Flow Control frame must be addressed to (rx_resp_id - 8), e.g., 0x7E0.
-     */
-    if (req_id == 0x7DFU && rx_resp_id >= 0x7E8U && rx_resp_id <= 0x7EFU) {
-        return rx_resp_id - 8U;
+    /* Per ISO 15765-4: when request was functional, Flow Control must be sent to the physical ECU ID */
+    if (cfg->addressing_type == 0U) {
+        /* 11-bit OBD-II response (0x7E8..0x7EF) -> physical tester-to-ECU ID is (rx_resp_id - 8) */
+        if (rx_resp_id >= 0x7E8U && rx_resp_id <= 0x7EFU) {
+            return rx_resp_id - 8U;
+        }
+        /* 29-bit OBD-II response (0x18DAF1xx) -> physical tester-to-ECU ID is 0x18DAxxF1 */
+        if ((rx_resp_id & 0xFFFFFF00U) == 0x18DAF100U) {
+            uint32_t ecu_sa = rx_resp_id & 0xFFU;
+            return 0x18DA00F1U | (ecu_sa << 8);
+        }
     }
-    return req_id;
+    return cfg->can_req_id;
 }
 
-static esp_err_t send_fc_frame(uint32_t fc_tx_id, uint8_t fs, uint8_t bs, uint8_t stmin_ms)
+static esp_err_t send_fc_frame(
+    uint32_t fc_tx_id,
+    uint8_t fs,
+    uint8_t bs,
+    uint8_t stmin,
+    uint8_t filler_byte
+)
 {
     vci_can_frame_t fc = {
         .id      = fc_tx_id,
         .is_extd = (fc_tx_id > 0x7FFU),
         .dlc     = 8U,
     };
-    memset(fc.data, ISOTP_PAD_BYTE, sizeof(fc.data));
+    memset(fc.data, filler_byte, sizeof(fc.data));
     fc.data[0] = (uint8_t)((ISOTP_PCI_FC << 4) | (fs & 0x0FU));
     fc.data[1] = bs;
-    fc.data[2] = stmin_ms;
+    fc.data[2] = stmin;
     return can_hal_send(&fc, 20);
 }
 
@@ -66,24 +84,23 @@ void isotp_rx_init(isotp_rx_ctx_t *ctx)
 }
 
 esp_err_t isotp_send_pdu(
-    uint32_t tx_can_id,
-    uint32_t expected_fc_can_id,
+    const isotp_config_t *cfg,
     const uint8_t *pdu,
     uint16_t pdu_len
 )
 {
-    if (pdu == NULL || pdu_len == 0U || pdu_len > ISOTP_MAX_PDU_LEN) {
+    if (cfg == NULL || pdu == NULL || pdu_len == 0U || pdu_len > ISOTP_MAX_PDU_LEN) {
         return ESP_ERR_INVALID_ARG;
     }
 
     /* 1. Single-Frame TX (<= 7 bytes) */
     if (pdu_len <= 7U) {
         vci_can_frame_t sf = {
-            .id      = tx_can_id,
-            .is_extd = (tx_can_id > 0x7FFU),
+            .id      = cfg->can_req_id,
+            .is_extd = (cfg->can_req_id > 0x7FFU),
             .dlc     = 8U,
         };
-        memset(sf.data, ISOTP_PAD_BYTE, sizeof(sf.data));
+        memset(sf.data, cfg->can_filler_byte, sizeof(sf.data));
         sf.data[0] = (uint8_t)(pdu_len & 0x0FU);
         memcpy(&sf.data[1], pdu, pdu_len);
         return can_hal_send(&sf, 20);
@@ -91,8 +108,8 @@ esp_err_t isotp_send_pdu(
 
     /* 2. Multi-Frame TX (> 7 bytes): Send First Frame (FF) */
     vci_can_frame_t ff = {
-        .id      = tx_can_id,
-        .is_extd = (tx_can_id > 0x7FFU),
+        .id      = cfg->can_req_id,
+        .is_extd = (cfg->can_req_id > 0x7FFU),
         .dlc     = 8U,
     };
     ff.data[0] = (uint8_t)((ISOTP_PCI_FF << 4) | ((pdu_len >> 8) & 0x0FU));
@@ -109,16 +126,17 @@ esp_err_t isotp_send_pdu(
     uint8_t  bs_rem = 0U;
     uint8_t  stmin = 0U;
     bool     need_fc = true;
+    uint32_t n_bs_ms = (cfg->n_bs_ms > 0U) ? cfg->n_bs_ms : 1000U;
 
     while (offset < pdu_len) {
         if (need_fc) {
-            int64_t fc_deadline_us = esp_timer_get_time() + ((int64_t)ISOTP_N_BS_TIMEOUT_MS * 1000LL);
+            int64_t fc_deadline_us = esp_timer_get_time() + ((int64_t)n_bs_ms * 1000LL);
             bool got_cts = false;
 
             while (esp_timer_get_time() < fc_deadline_us) {
                 vci_can_frame_t rx;
                 if (can_hal_recv(&rx, 5) == ESP_OK) {
-                    if (!is_matching_resp_id(rx.id, expected_fc_can_id, tx_can_id) || rx.dlc < 3U) {
+                    if (!is_matching_resp_id(rx.id, cfg) || rx.dlc < 3U) {
                         continue;
                     }
                     uint8_t pci_type = (rx.data[0] >> 4) & 0x0FU;
@@ -132,7 +150,7 @@ esp_err_t isotp_send_pdu(
                         got_cts = true;
                         break;
                     } else if (fs == ISOTP_FC_FS_WAIT) {
-                        fc_deadline_us = esp_timer_get_time() + ((int64_t)ISOTP_N_BS_TIMEOUT_MS * 1000LL);
+                        fc_deadline_us = esp_timer_get_time() + ((int64_t)n_bs_ms * 1000LL);
                     } else {
                         return ESP_ERR_INVALID_SIZE; /* Overflow */
                     }
@@ -154,11 +172,11 @@ esp_err_t isotp_send_pdu(
         }
 
         vci_can_frame_t cf = {
-            .id      = tx_can_id,
-            .is_extd = (tx_can_id > 0x7FFU),
+            .id      = cfg->can_req_id,
+            .is_extd = (cfg->can_req_id > 0x7FFU),
             .dlc     = 8U,
         };
-        memset(cf.data, ISOTP_PAD_BYTE, sizeof(cf.data));
+        memset(cf.data, cfg->can_filler_byte, sizeof(cf.data));
         cf.data[0] = (uint8_t)((ISOTP_PCI_CF << 4) | (sn & 0x0FU));
 
         uint16_t chunk = pdu_len - offset;
@@ -189,13 +207,10 @@ esp_err_t isotp_send_pdu(
 isotp_rx_status_t isotp_rx_feed_frame(
     isotp_rx_ctx_t *ctx,
     const vci_can_frame_t *frame,
-    uint32_t expected_resp_id,
-    uint32_t req_id,
-    uint8_t fc_bs,
-    uint8_t fc_stmin_ms
+    const isotp_config_t *cfg
 )
 {
-    if (ctx == NULL || frame == NULL || frame->dlc < 2U) {
+    if (ctx == NULL || frame == NULL || cfg == NULL || frame->dlc < 2U) {
         return ISOTP_RX_IGNORED;
     }
 
@@ -205,7 +220,7 @@ isotp_rx_status_t isotp_rx_feed_frame(
             return ISOTP_RX_IGNORED;
         }
     } else {
-        if (!is_matching_resp_id(frame->id, expected_resp_id, req_id)) {
+        if (!is_matching_resp_id(frame->id, cfg)) {
             return ISOTP_RX_IGNORED;
         }
     }
@@ -233,14 +248,14 @@ isotp_rx_status_t isotp_rx_feed_frame(
                 return ISOTP_RX_IGNORED;
             }
             uint16_t ff_len = (uint16_t)(((uint16_t)(frame->data[0] & 0x0FU) << 8) | frame->data[1]);
-            uint32_t fc_id  = derive_fc_tx_can_id(frame->id, req_id);
+            uint32_t fc_id  = derive_fc_tx_can_id(frame->id, cfg);
 
             if (ff_len < 8U) {
                 return ISOTP_RX_IGNORED;
             }
             if (ff_len > ISOTP_MAX_PDU_LEN) {
                 /* Send Flow Control with Overflow (FS=0x02) per ISO 15765-2 */
-                (void)send_fc_frame(fc_id, ISOTP_FC_FS_OVFLW, 0U, 0U);
+                (void)send_fc_frame(fc_id, ISOTP_FC_FS_OVFLW, 0U, 0U, cfg->can_filler_byte);
                 ctx->in_progress = false;
                 return ISOTP_RX_ERR_OVERFLOW;
             }
@@ -251,11 +266,17 @@ isotp_rx_status_t isotp_rx_feed_frame(
             ctx->total_len   = ff_len;
             ctx->offset      = 6U;
             ctx->next_sn     = 1U;
-            ctx->bs_counter  = fc_bs;
+            ctx->bs_counter  = cfg->fc_bs;
             memcpy(ctx->pdu, &frame->data[2], 6U);
 
             /* Transmit Flow Control (CTS = 0x30) back to the ECU */
-            if (send_fc_frame(ctx->fc_tx_id, ISOTP_FC_FS_CTS, fc_bs, fc_stmin_ms) != ESP_OK) {
+            if (send_fc_frame(
+                    ctx->fc_tx_id,
+                    ISOTP_FC_FS_CTS,
+                    cfg->fc_bs,
+                    cfg->fc_stmin,
+                    cfg->can_filler_byte
+                ) != ESP_OK) {
                 ctx->in_progress = false;
                 return ISOTP_RX_ERR_FC_TX;
             }
@@ -291,11 +312,17 @@ isotp_rx_status_t isotp_rx_feed_frame(
             }
 
             /* If BlockSize > 0 and block finished, transmit another Flow Control CTS */
-            if (fc_bs > 0U && ctx->bs_counter > 0U) {
+            if (cfg->fc_bs > 0U && ctx->bs_counter > 0U) {
                 ctx->bs_counter--;
                 if (ctx->bs_counter == 0U) {
-                    ctx->bs_counter = fc_bs;
-                    if (send_fc_frame(ctx->fc_tx_id, ISOTP_FC_FS_CTS, fc_bs, fc_stmin_ms) != ESP_OK) {
+                    ctx->bs_counter = cfg->fc_bs;
+                    if (send_fc_frame(
+                            ctx->fc_tx_id,
+                            ISOTP_FC_FS_CTS,
+                            cfg->fc_bs,
+                            cfg->fc_stmin,
+                            cfg->can_filler_byte
+                        ) != ESP_OK) {
                         ctx->in_progress = false;
                         return ISOTP_RX_ERR_FC_TX;
                     }

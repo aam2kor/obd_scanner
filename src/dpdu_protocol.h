@@ -19,7 +19,7 @@
 
 /* Host -> VCI Command Opcodes */
 typedef enum {
-    PDU_CMD_CONNECT         = 0x01, /* [bus_mode:1B][baud_khz:2B][flags:1B] */
+    PDU_CMD_CONNECT         = 0x01, /* [bus_mode:1B] (or legacy 4B [bus_mode:1B][baud_khz:2B][flags:1B]) */
     PDU_CMD_DISCONNECT      = 0x02, /* Empty */
     PDU_CMD_SET_COMPARAM    = 0x03, /* [param_id:1B][param_val:4B (<I)] */
     PDU_CMD_START_COP       = 0x04, /* [cop_type:1B][flags:1B][pdu:N B] */
@@ -51,17 +51,38 @@ typedef enum {
     PDU_ERR_CAN_BUS_OFF     = 0x03,
     PDU_ERR_CRC_MISMATCH    = 0x04,
     PDU_ERR_MALFORMED_FRAME = 0x05,
+    PDU_ERR_CANCELLED       = 0x06,
 } dpdu_err_code_t;
 
-/* ComParam IDs (for PDU_CMD_SET_COMPARAM / PDU_CMD_GET_COMPARAM) */
+/* ISO 22900-2 Aligned ComParam IDs (for PDU_CMD_SET_COMPARAM / PDU_CMD_GET_COMPARAM) */
 typedef enum {
-    CP_CAN_PHYS_REQ_ID      = 0x01, /* Default: 0x000007DF */
-    CP_CAN_RESP_USDT_ID     = 0x02, /* Default: 0x000007E8 */
-    CP_P2_MAX_MS            = 0x03, /* Default: 50 ms */
-    CP_P2_STAR_MS           = 0x04, /* Default: 5000 ms */
-    CP_ISOTP_BS             = 0x05, /* Default: 0 (continuous) */
-    CP_ISOTP_STMIN_MS       = 0x06, /* Default: 0 ms */
+    /* Physical Layer */
+    CP_BAUDRATE             = 0x01, /* Default: 500000 bps (125000, 250000, 500000, 1000000) */
+
+    /* CAN Addressing Layer */
+    CP_CAN_PHYS_REQ_ID      = 0x02, /* Default: 0x000007DF (or 0x7E0, 0x18DB33F1, 0x18DAxxF1) */
+    CP_CAN_RESP_USDT_ID     = 0x03, /* Default: 0x000007E8 (or 0x18DAF1xx) */
+    CP_ADDRESSING_TYPE      = 0x04, /* Default: 0 (0 = FUNCTIONAL, 1 = PHYSICAL) */
+
+    /* ISO 15765-2 (ISO-TP) Transport Layer */
+    CP_CAN_FILLER_BYTE      = 0x05, /* Default: 0xCC (0x00..0xFF padding byte) */
+    CP_BLOCK_SIZE           = 0x06, /* Default: 0 (Flow Control BS: 0 = continuous, 1..255) */
+    CP_ST_MIN               = 0x07, /* Default: 0 (Flow Control STmin: 0..127 ms or 0xF1..0xF9) */
+    CP_N_BS_MS              = 0x08, /* Default: 1000 ms (ISO-TP Sender wait for Flow Control) */
+    CP_N_CR_MS              = 0x09, /* Default: 1000 ms (ISO-TP Receiver wait for Consecutive Frame) */
+
+    /* ISO 15765-3 / ISO 14229-2 Application Timing Layer */
+    CP_P2_MAX_MS            = 0x0A, /* Default: 50 ms (Max time from TX to initial ECU response) */
+    CP_P2_STAR_MS           = 0x0B, /* Default: 5000 ms (Extended timeout on NRC 0x78 ResponsePending) */
+    CP_P3_PHYS_MS           = 0x0C, /* Default: 5 ms (Min inter-request gap after Physical request) */
+    CP_P3_FUNC_MS           = 0x0D, /* Default: 50 ms (Functional collection window & min inter-request gap) */
 } dpdu_comparam_id_t;
+
+/* Addressing Types (for CP_ADDRESSING_TYPE) */
+typedef enum {
+    DPDU_ADDR_FUNCTIONAL    = 0x00,
+    DPDU_ADDR_PHYSICAL      = 0x01,
+} dpdu_addr_type_t;
 
 /* ComPrimitive Types */
 typedef enum {
@@ -113,17 +134,35 @@ typedef struct {
 typedef struct {
     bool     connected;
     uint8_t  bus_mode;
-    uint16_t baud_khz;
     uint8_t  connect_flags;
-    uint32_t can_req_id;
-    uint32_t can_resp_id;
-    uint32_t p2_max_ms;
-    uint32_t p2_star_ms;
-    uint32_t isotp_bs;
-    uint32_t isotp_stmin_ms;
+
+    /* 13 Standard ComParams */
+    uint32_t baudrate_bps;      /* CP_BAUDRATE */
+    uint32_t can_req_id;        /* CP_CAN_PHYS_REQ_ID */
+    uint32_t can_resp_id;       /* CP_CAN_RESP_USDT_ID */
+    uint32_t addressing_type;   /* CP_ADDRESSING_TYPE (0=FUNC, 1=PHYS) */
+    uint32_t can_filler_byte;   /* CP_CAN_FILLER_BYTE */
+    uint32_t isotp_bs;          /* CP_BLOCK_SIZE */
+    uint32_t isotp_stmin;       /* CP_ST_MIN */
+    uint32_t isotp_n_bs_ms;     /* CP_N_BS_MS */
+    uint32_t isotp_n_cr_ms;     /* CP_N_CR_MS */
+    uint32_t p2_max_ms;         /* CP_P2_MAX_MS */
+    uint32_t p2_star_ms;        /* CP_P2_STAR_MS */
+    uint32_t p3_phys_ms;        /* CP_P3_PHYS_MS */
+    uint32_t p3_func_ms;        /* CP_P3_FUNC_MS */
+
+    /* P3 Inter-Request Timing State */
+    int64_t  next_allowed_tx_us;
+
+    /* Diagnostics Counters */
     uint32_t rx_cmd_count;
     uint32_t crc_err_count;
 } dpdu_vci_state_t;
+
+/**
+ * @brief Optional callback to check if a PDU_CMD_CANCEL_COP arrived while a ComPrimitive is in flight.
+ */
+typedef bool (*dpdu_check_cancel_fn_t)(dpdu_frame_t *out_cancel_cmd);
 
 /**
  * @brief Compute CRC-16/CCITT-FALSE (poly=0x1021, init=0xFFFF).
@@ -157,6 +196,11 @@ typedef void (*dpdu_emit_evt_fn_t)(const dpdu_frame_t *evt);
 void dpdu_engine_init(dpdu_vci_state_t *state);
 
 /**
+ * @brief Register a non-blocking cancel-check hook used during active ComPrimitives.
+ */
+void dpdu_engine_set_cancel_checker(dpdu_check_cancel_fn_t cancel_fn);
+
+/**
  * @brief Process an incoming Host D-PDU command and emit response/event frames.
  */
 void dpdu_engine_process_cmd(
@@ -166,4 +210,3 @@ void dpdu_engine_process_cmd(
 );
 
 #endif /* DPDU_PROTOCOL_H */
-

@@ -15,12 +15,23 @@ import time
 from typing import Optional, Tuple
 
 from dpdu_client import (
+    CP_ADDRESSING_TYPE,
+    CP_BAUDRATE,
+    CP_BLOCK_SIZE,
+    CP_CAN_FILLER_BYTE,
     CP_CAN_PHYS_REQ_ID,
     CP_CAN_RESP_USDT_ID,
     CP_ISOTP_BS,
     CP_ISOTP_STMIN_MS,
+    CP_N_BS_MS,
+    CP_N_CR_MS,
     CP_P2_MAX_MS,
     CP_P2_STAR_MS,
+    CP_P3_FUNC_MS,
+    CP_P3_PHYS_MS,
+    CP_ST_MIN,
+    DPDU_ADDR_FUNCTIONAL,
+    DPDU_ADDR_PHYSICAL,
     DpduFrame,
     DpduResultEvent,
     DpduStreamParser,
@@ -145,9 +156,12 @@ class LeanDpduBleClient:
         }
 
     async def pdu_connect(
-        self, bus_mode: int = VCI_BUS_MODE_SIM_LOOPBACK, baud_khz: int = 500, flags: int = 0
+        self, bus_mode: int = VCI_BUS_MODE_SIM_LOOPBACK, baud_khz: int = 0, flags: int = 0
     ) -> DpduFrame:
-        payload = struct.pack("<BHB", bus_mode, baud_khz, flags)
+        if baud_khz == 0 and flags == 0:
+            payload = struct.pack("<B", bus_mode)
+        else:
+            payload = struct.pack("<BHB", bus_mode, baud_khz, flags)
         return await self.send_and_recv(PDU_CMD_CONNECT, payload)
 
     async def pdu_disconnect(self) -> DpduFrame:
@@ -199,10 +213,11 @@ async def run_step4_ble_verification(address: Optional[str] = None):
             f"crc_errs={st['crc_err_count']}, can_req_id=0x{st['can_req_id']:03X}"
         )
 
-        print("[3/8] Opening Logical Link over BLE (PDU_CMD_CONNECT: SimLoopback, 500 kbps)...")
-        ack = await ble.pdu_connect(bus_mode=VCI_BUS_MODE_SIM_LOOPBACK, baud_khz=500)
+        print("[3/8] Configuring CP_BAUDRATE=500000 bps & Opening Logical Link over BLE...")
+        await ble.pdu_set_com_param(CP_BAUDRATE, 500000)
+        ack = await ble.pdu_connect(bus_mode=VCI_BUS_MODE_SIM_LOOPBACK)
         assert ack.opcode == PDU_EVT_CMD_ACK and ack.payload[1] == PDU_STATUS_NOERROR
-        print("      Logical Link Connected!")
+        print("      Logical Link Connected (CP_BAUDRATE=500000 bps)!")
 
         print("[4/8] Reading Live OBD-II Telemetry over BLE (Mode 01 PIDs 00, 0C, 0D, 05, 11)...")
         _, evt_00 = await ble.pdu_start_com_primitive(b"\x01\x00")

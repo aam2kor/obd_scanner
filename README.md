@@ -89,10 +89,10 @@ This project implements a dual-core **ESP32 OBD-II Vehicle Communication Interfa
   - `src/main.c` — Dual-transport Host I/O task (UART0 + BLE NUS) and FreeRTOS queue routing
   - `src/led_status.h` / `src/led_status.c` — Non-blocking status LED state machine on `GPIO 2`
 - **Core 1 (`APP_CPU`) — Hard Real-Time Automotive Stack:**
-  - `src/dpdu_protocol.h` / `src/dpdu_protocol.c` — Binary Lean D-PDU (`0xA5` SOF + 8B Header + Payload + CRC-16/CCITT-FALSE), ComParam engine, and `P2_Max` (`50 ms`) / `P2*_Max` (`5000 ms` on NRC `0x78`) timers
-  - `src/isotp.h` / `src/isotp.c` — Bidirectional ISO 15765-2 (ISO-TP) Single-Frame (`SF`) and Multi-Frame (`FF` / `FC` / `CF`) segmentation & reassembly (`N_Bs = 1000 ms`, `N_Cr = 1000 ms`)
-  - `src/can_hal.h` / `src/can_hal.c` — CAN Classic 2.0B HAL (`driver/twai.h` on `GPIO 21` TX / `GPIO 22` RX + Virtual Loopback mode)
-  - `src/ecu_sim.h` / `src/ecu_sim.c` — Virtual OBD-II / UDS ECU simulator (Modes `01`, `03`, `04`, `09` 17-char VIN & Cal ID, UDS `0x2E`)
+  - `src/dpdu_protocol.h` / `src/dpdu_protocol.c` — Binary Lean D-PDU (`0xA5` SOF + 8B Header + Payload + CRC-16/CCITT-FALSE), 13-parameter ISO 22900-2 ComParam table (`CP_BAUDRATE`, `CP_CAN_PHYS_REQ_ID`, `CP_CAN_RESP_USDT_ID`, `CP_ADDRESSING_TYPE`, `CP_CAN_FILLER_BYTE`, `CP_BLOCK_SIZE`, `CP_ST_MIN`, `CP_N_BS_MS`, `CP_N_CR_MS`, `CP_P2_MAX_MS`, `CP_P2_STAR_MS`, `CP_P3_PHYS_MS`, `CP_P3_FUNC_MS`), SID response validation, and in-flight `PDU_CMD_CANCEL_COP`
+  - `src/isotp.h` / `src/isotp.c` — Bidirectional ISO 15765-2 (ISO-TP) Single-Frame (`SF`) and Multi-Frame (`FF` / `FC` / `CF`) segmentation & reassembly supporting both 11-bit (`0x7DF`/`0x7E8..0x7EF`) and 29-bit (`0x18DB33F1`/`0x18DAF1xx`) CAN addressing
+  - `src/can_hal.h` / `src/can_hal.c` — CAN Classic 2.0B HAL (`driver/twai.h` on `GPIO 21` TX / `GPIO 22` RX at `125` / `250` / `500` / `1000 kbps` + Virtual Loopback mode)
+  - `src/ecu_sim.h` / `src/ecu_sim.c` — Virtual OBD-II / UDS ECU simulator (11-bit & 29-bit CAN, Modes `01`, `03`, `04`, `09` 17-char VIN & Cal ID, UDS `0x2E`)
 
 ### PC OBD-II Diagnostic Scanner (`pc_app/`)
 - `pc_app/dpdu_client.py` — Binary Lean D-PDU serial client & automated hardware verification suites (Steps 1–3)

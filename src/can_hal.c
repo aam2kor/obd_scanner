@@ -52,7 +52,9 @@ esp_err_t can_hal_start(uint8_t bus_mode, uint16_t baud_khz)
         g_config.tx_queue_len = 16;
 
         twai_timing_config_t t_config;
-        if (baud_khz == 250U) {
+        if (baud_khz == 125U) {
+            t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_125KBITS();
+        } else if (baud_khz == 250U) {
             t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_250KBITS();
         } else if (baud_khz == 1000U) {
             t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_1MBITS();

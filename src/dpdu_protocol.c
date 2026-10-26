@@ -1,14 +1,25 @@
 /**
  * @file dpdu_protocol.c
- * @brief Lean D-PDU API binary wire framing, CRC-16-CCITT, and ComPrimitive/P2/P2* engine.
+ * @brief Lean D-PDU API (ISO 22900-2 subset) binary wire framing, CRC-16-CCITT,
+ *        13-ComParam Table, and ComPrimitive / ISO-TP / P2 / P2* / P3 engine.
  */
 
 #include "dpdu_protocol.h"
 #include "can_hal.h"
 #include "isotp.h"
 #include "led_status.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include <string.h>
+
+static dpdu_check_cancel_fn_t s_cancel_check_fn = NULL;
+
+void dpdu_engine_set_cancel_checker(dpdu_check_cancel_fn_t cancel_fn)
+{
+    s_cancel_check_fn = cancel_fn;
+}
 
 static uint16_t read_u16_le(const uint8_t *p)
 {
@@ -150,15 +161,24 @@ size_t dpdu_encode_frame(const dpdu_frame_t *frame, uint8_t *out_buf, size_t out
 void dpdu_engine_init(dpdu_vci_state_t *state)
 {
     memset(state, 0, sizeof(*state));
-    state->connected      = false;
-    state->bus_mode       = VCI_BUS_MODE_SIM_LOOPBACK;
-    state->baud_khz       = 500;
-    state->can_req_id     = 0x000007DFU;
-    state->can_resp_id    = 0x000007E8U;
-    state->p2_max_ms      = 50U;
-    state->p2_star_ms     = 5000U;
-    state->isotp_bs       = 0U;
-    state->isotp_stmin_ms = 0U;
+    state->connected          = false;
+    state->bus_mode           = VCI_BUS_MODE_SIM_LOOPBACK;
+
+    /* Initialize all 13 ISO 22900-2 aligned ComParams */
+    state->baudrate_bps       = 500000U;                /* CP_BAUDRATE */
+    state->can_req_id         = 0x000007DFU;            /* CP_CAN_PHYS_REQ_ID */
+    state->can_resp_id        = 0x000007E8U;            /* CP_CAN_RESP_USDT_ID */
+    state->addressing_type    = DPDU_ADDR_FUNCTIONAL;   /* CP_ADDRESSING_TYPE */
+    state->can_filler_byte    = 0xCCU;                  /* CP_CAN_FILLER_BYTE */
+    state->isotp_bs           = 0U;                     /* CP_BLOCK_SIZE */
+    state->isotp_stmin        = 0U;                     /* CP_ST_MIN */
+    state->isotp_n_bs_ms      = 1000U;                  /* CP_N_BS_MS */
+    state->isotp_n_cr_ms      = 1000U;                  /* CP_N_CR_MS */
+    state->p2_max_ms          = 50U;                    /* CP_P2_MAX_MS */
+    state->p2_star_ms         = 5000U;                  /* CP_P2_STAR_MS */
+    state->p3_phys_ms         = 5U;                     /* CP_P3_PHYS_MS */
+    state->p3_func_ms         = 50U;                    /* CP_P3_FUNC_MS */
+    state->next_allowed_tx_us = 0LL;
 }
 
 static void emit_ack(
@@ -227,6 +247,69 @@ static void emit_error(
     emit_fn(&rsp);
 }
 
+static bool is_valid_baudrate_bps(uint32_t *inout_baud)
+{
+    /* Accept either bps (125000, 250000, 500000, 1000000) or kHz (125, 250, 500, 1000) */
+    if (*inout_baud == 125U || *inout_baud == 250U || *inout_baud == 500U || *inout_baud == 1000U) {
+        *inout_baud *= 1000U;
+    }
+    return (*inout_baud == 125000U ||
+            *inout_baud == 250000U ||
+            *inout_baud == 500000U ||
+            *inout_baud == 1000000U);
+}
+
+static void enforce_p3_inter_request_delay(dpdu_vci_state_t *state)
+{
+    int64_t now_us = esp_timer_get_time();
+    if (now_us >= state->next_allowed_tx_us) {
+        return;
+    }
+
+    int64_t wait_us = state->next_allowed_tx_us - now_us;
+    if (wait_us >= 10000LL) {
+        TickType_t ticks = pdMS_TO_TICKS((uint32_t)(wait_us / 1000LL));
+        if (ticks > 0) {
+            vTaskDelay(ticks);
+        }
+    }
+    now_us = esp_timer_get_time();
+    if (now_us < state->next_allowed_tx_us) {
+        esp_rom_delay_us((uint32_t)(state->next_allowed_tx_us - now_us));
+    }
+}
+
+static void schedule_next_p3_window(dpdu_vci_state_t *state, int64_t t_req_start_us, bool send_only)
+{
+    int64_t now_us = esp_timer_get_time();
+    if (state->addressing_type == DPDU_ADDR_FUNCTIONAL) {
+        /* Functional requests must respect CP_P3_FUNC_MS from request start (and at least CP_P3_PHYS_MS after completion) */
+        int64_t func_end_us = t_req_start_us + ((int64_t)state->p3_func_ms * 1000LL);
+        int64_t min_gap_us  = now_us + ((int64_t)state->p3_phys_ms * 1000LL);
+        state->next_allowed_tx_us = (func_end_us > min_gap_us) ? func_end_us : min_gap_us;
+    } else {
+        /* Physical requests enforce CP_P3_PHYS_MS after response (or CP_P2_MAX_MS if SEND_ONLY) */
+        uint32_t gap_ms = send_only ? state->p2_max_ms : state->p3_phys_ms;
+        state->next_allowed_tx_us = now_us + ((int64_t)gap_ms * 1000LL);
+    }
+}
+
+static bool is_matching_diagnostic_sid(uint8_t req_sid, const uint8_t *rx_pdu, uint16_t rx_len)
+{
+    if (rx_len == 0U) {
+        return false;
+    }
+    /* Positive Response: SID + 0x40 (e.g., 0x01 -> 0x41, 0x09 -> 0x49, 0x2E -> 0x6E) */
+    if (rx_pdu[0] == (uint8_t)(req_sid + 0x40U)) {
+        return true;
+    }
+    /* Negative Response: [0x7F, req_sid, NRC] */
+    if (rx_len >= 3U && rx_pdu[0] == 0x7FU && rx_pdu[1] == req_sid) {
+        return true;
+    }
+    return false;
+}
+
 static void execute_start_cop(
     dpdu_vci_state_t *state,
     const dpdu_frame_t *cmd,
@@ -242,7 +325,7 @@ static void execute_start_cop(
         return;
     }
 
-    uint8_t cop_type = cmd->payload[0];
+    uint8_t cop_type       = cmd->payload[0];
     const uint8_t *pdu_req = &cmd->payload[2];
     uint16_t pdu_req_len   = cmd->length - 2U;
 
@@ -254,9 +337,24 @@ static void execute_start_cop(
     /* 1. Acknowledge ComPrimitive acceptance */
     emit_ack(emit_fn, cmd, PDU_STATUS_NOERROR, NULL, 0);
 
-    /* 2. Transmit PDU over ISO-TP / CAN HAL */
+    /* 2. Enforce CP_P3_PHYS_MS / CP_P3_FUNC_MS inter-request timing before transmitting */
+    enforce_p3_inter_request_delay(state);
+
+    /* 3. Build ISO-TP Configuration from the 13-ComParam Table */
+    isotp_config_t isotp_cfg = {
+        .can_req_id      = state->can_req_id,
+        .can_resp_id     = state->can_resp_id,
+        .addressing_type = (uint8_t)state->addressing_type,
+        .can_filler_byte = (uint8_t)state->can_filler_byte,
+        .fc_bs           = (uint8_t)state->isotp_bs,
+        .fc_stmin        = (uint8_t)state->isotp_stmin,
+        .n_bs_ms         = state->isotp_n_bs_ms,
+        .n_cr_ms         = state->isotp_n_cr_ms,
+    };
+
+    /* 4. Transmit PDU over ISO-TP / CAN HAL */
     int64_t t_start_us = esp_timer_get_time();
-    esp_err_t tx_err = isotp_send_pdu(state->can_req_id, state->can_resp_id, pdu_req, pdu_req_len);
+    esp_err_t tx_err = isotp_send_pdu(&isotp_cfg, pdu_req, pdu_req_len);
     if (tx_err != ESP_OK) {
         uint8_t err_code = (tx_err == ESP_ERR_TIMEOUT) ? PDU_ERR_ISOTP_TIMEOUT : PDU_ERR_CAN_BUS_OFF;
         emit_error(emit_fn, cmd, err_code, (uint8_t)tx_err);
@@ -264,10 +362,11 @@ static void execute_start_cop(
     }
 
     if (cop_type == PDU_COPT_SEND_ONLY) {
+        schedule_next_p3_window(state, t_start_us, true);
         return;
     }
 
-    /* 3. Wait for ECU response within P2_Max (or P2*_Max on NRC 0x78, or N_Cr during Multi-Frame) */
+    /* 5. Wait for ECU response within CP_P2_MAX_MS (or CP_P2_STAR_MS on NRC 0x78, or CP_N_CR_MS during Multi-Frame) */
     uint8_t req_sid = pdu_req[0];
     int64_t deadline_us = esp_timer_get_time() + ((int64_t)state->p2_max_ms * 1000LL);
     vci_can_frame_t rx_frame;
@@ -275,6 +374,16 @@ static void execute_start_cop(
     isotp_rx_init(&rx_ctx);
 
     while (esp_timer_get_time() < deadline_us) {
+        /* Check if Host sent PDU_CMD_CANCEL_COP while ComPrimitive is in flight */
+        if (s_cancel_check_fn != NULL) {
+            dpdu_frame_t cancel_cmd;
+            if (s_cancel_check_fn(&cancel_cmd)) {
+                emit_ack(emit_fn, &cancel_cmd, PDU_STATUS_NOERROR, NULL, 0);
+                emit_error(emit_fn, cmd, PDU_ERR_CANCELLED, req_sid);
+                return;
+            }
+        }
+
         int64_t rem_us = deadline_us - esp_timer_get_time();
         uint32_t wait_ms = (uint32_t)((rem_us + 999LL) / 1000LL);
         if (wait_ms > 5U) {
@@ -284,42 +393,45 @@ static void execute_start_cop(
         }
 
         if (can_hal_recv(&rx_frame, wait_ms) == ESP_OK) {
-            isotp_rx_status_t st = isotp_rx_feed_frame(
-                &rx_ctx,
-                &rx_frame,
-                state->can_resp_id,
-                state->can_req_id,
-                (uint8_t)state->isotp_bs,
-                (uint8_t)state->isotp_stmin_ms
-            );
+            isotp_rx_status_t st = isotp_rx_feed_frame(&rx_ctx, &rx_frame, &isotp_cfg);
 
             if (st == ISOTP_RX_IN_PROGRESS) {
-                /* Multi-Frame FF or intermediate CF received; reset deadline to N_Cr (1000 ms) */
-                deadline_us = esp_timer_get_time() + ((int64_t)ISOTP_N_CR_TIMEOUT_MS * 1000LL);
+                /* Multi-Frame FF or intermediate CF received; reset deadline to CP_N_CR_MS */
+                deadline_us = esp_timer_get_time() + ((int64_t)state->isotp_n_cr_ms * 1000LL);
             } else if (st == ISOTP_RX_COMPLETE) {
+                /* Verify SID matches Positive Response (SID + 0x40) or Negative Response (0x7F + SID) */
+                if (!is_matching_diagnostic_sid(req_sid, rx_ctx.pdu, rx_ctx.total_len)) {
+                    isotp_rx_init(&rx_ctx);
+                    continue;
+                }
+
                 /* Check for UDS/OBD Negative Response 0x7F [SID] 0x78 (ResponsePending) */
                 if (rx_ctx.total_len >= 3U &&
                     rx_ctx.pdu[0] == 0x7FU &&
                     rx_ctx.pdu[1] == req_sid &&
                     rx_ctx.pdu[2] == 0x78U) {
-                    /* Extend timeout to P2*_Max (5000ms default) and re-arm ISO-TP RX */
+                    /* Extend timeout to CP_P2_STAR_MS (5000ms default) and re-arm ISO-TP RX */
                     isotp_rx_init(&rx_ctx);
                     deadline_us = esp_timer_get_time() + ((int64_t)state->p2_star_ms * 1000LL);
                     continue;
                 }
 
                 uint16_t elapsed_ms = (uint16_t)((esp_timer_get_time() - t_start_us) / 1000LL);
+                schedule_next_p3_window(state, t_start_us, false);
                 led_status_pulse_activity();
                 emit_result(emit_fn, cmd, rx_ctx.rx_can_id, elapsed_ms, rx_ctx.pdu, rx_ctx.total_len);
                 return;
             } else if (st == ISOTP_RX_ERR_SEQ || st == ISOTP_RX_ERR_OVERFLOW || st == ISOTP_RX_ERR_FC_TX) {
+                schedule_next_p3_window(state, t_start_us, false);
                 emit_error(emit_fn, cmd, PDU_ERR_MALFORMED_FRAME, (uint8_t)st);
                 return;
             }
         }
     }
 
-    /* Timeout expired: distinguish Multi-Frame N_Cr timeout from initial P2/P2* timeout */
+    schedule_next_p3_window(state, t_start_us, false);
+
+    /* Timeout expired: distinguish Multi-Frame CP_N_CR_MS timeout from initial CP_P2_MAX_MS timeout */
     if (rx_ctx.in_progress) {
         emit_error(emit_fn, cmd, PDU_ERR_ISOTP_TIMEOUT, req_sid);
     } else {
@@ -338,34 +450,46 @@ void dpdu_engine_process_cmd(
 
     switch (cmd->opcode) {
         case PDU_CMD_CONNECT: {
-            if (cmd->length < 4U) {
+            if (cmd->length < 1U) {
                 emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
                 return;
             }
             uint8_t  bus_mode = cmd->payload[0];
-            uint16_t baud_khz = read_u16_le(&cmd->payload[1]);
-            uint8_t  flags    = cmd->payload[3];
+            uint16_t baud_khz = (uint16_t)(state->baudrate_bps / 1000U);
+            uint8_t  flags    = 0U;
 
+            if (cmd->length >= 3U) {
+                uint16_t req_baud_khz = read_u16_le(&cmd->payload[1]);
+                if (req_baud_khz != 0U) {
+                    baud_khz = req_baud_khz;
+                }
+            }
+            if (cmd->length >= 4U) {
+                flags = cmd->payload[3];
+            }
+
+            uint32_t baud_bps = (uint32_t)baud_khz * 1000U;
             if ((bus_mode != VCI_BUS_MODE_SIM_LOOPBACK && bus_mode != VCI_BUS_MODE_PHYSICAL_CAN) ||
-                (baud_khz != 250U && baud_khz != 500U && baud_khz != 1000U)) {
+                !is_valid_baudrate_bps(&baud_bps)) {
                 emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
                 return;
             }
 
-            if (can_hal_start(bus_mode, baud_khz) != ESP_OK) {
+            if (can_hal_start(bus_mode, (uint16_t)(baud_bps / 1000U)) != ESP_OK) {
                 emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
                 return;
             }
 
-            state->connected     = true;
-            state->bus_mode      = bus_mode;
-            state->baud_khz      = baud_khz;
-            state->connect_flags = flags;
+            state->connected          = true;
+            state->bus_mode           = bus_mode;
+            state->baudrate_bps       = baud_bps;
+            state->connect_flags      = flags;
+            state->next_allowed_tx_us = 0LL;
             led_status_set_mode(VCI_LED_CONNECTED_IDLE);
 
             uint8_t info[4];
             info[0] = state->bus_mode;
-            write_u16_le(&info[1], state->baud_khz);
+            write_u16_le(&info[1], (uint16_t)(state->baudrate_bps / 1000U));
             info[3] = state->connect_flags;
             emit_ack(emit_fn, cmd, PDU_STATUS_NOERROR, info, sizeof(info));
             return;
@@ -388,12 +512,92 @@ void dpdu_engine_process_cmd(
             uint32_t param_val = read_u32_le(&cmd->payload[1]);
 
             switch (param_id) {
-                case CP_CAN_PHYS_REQ_ID:  state->can_req_id     = param_val; break;
-                case CP_CAN_RESP_USDT_ID: state->can_resp_id    = param_val; break;
-                case CP_P2_MAX_MS:        state->p2_max_ms      = param_val; break;
-                case CP_P2_STAR_MS:       state->p2_star_ms     = param_val; break;
-                case CP_ISOTP_BS:         state->isotp_bs       = param_val; break;
-                case CP_ISOTP_STMIN_MS:   state->isotp_stmin_ms = param_val; break;
+                case CP_BAUDRATE:
+                    if (!is_valid_baudrate_bps(&param_val)) {
+                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+                        return;
+                    }
+                    state->baudrate_bps = param_val;
+                    if (state->connected) {
+                        (void)can_hal_start(state->bus_mode, (uint16_t)(state->baudrate_bps / 1000U));
+                    }
+                    break;
+                case CP_CAN_PHYS_REQ_ID:
+                    state->can_req_id = param_val;
+                    break;
+                case CP_CAN_RESP_USDT_ID:
+                    state->can_resp_id = param_val;
+                    break;
+                case CP_ADDRESSING_TYPE:
+                    if (param_val > DPDU_ADDR_PHYSICAL) {
+                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+                        return;
+                    }
+                    state->addressing_type = param_val;
+                    break;
+                case CP_CAN_FILLER_BYTE:
+                    if (param_val > 0xFFU) {
+                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+                        return;
+                    }
+                    state->can_filler_byte = param_val;
+                    break;
+                case CP_BLOCK_SIZE:
+                    if (param_val > 0xFFU) {
+                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+                        return;
+                    }
+                    state->isotp_bs = param_val;
+                    break;
+                case CP_ST_MIN:
+                    if (param_val > 0xFFU) {
+                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+                        return;
+                    }
+                    state->isotp_stmin = param_val;
+                    break;
+                case CP_N_BS_MS:
+                    if (param_val == 0U || param_val > 60000U) {
+                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+                        return;
+                    }
+                    state->isotp_n_bs_ms = param_val;
+                    break;
+                case CP_N_CR_MS:
+                    if (param_val == 0U || param_val > 60000U) {
+                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+                        return;
+                    }
+                    state->isotp_n_cr_ms = param_val;
+                    break;
+                case CP_P2_MAX_MS:
+                    if (param_val == 0U || param_val > 60000U) {
+                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+                        return;
+                    }
+                    state->p2_max_ms = param_val;
+                    break;
+                case CP_P2_STAR_MS:
+                    if (param_val == 0U || param_val > 60000U) {
+                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+                        return;
+                    }
+                    state->p2_star_ms = param_val;
+                    break;
+                case CP_P3_PHYS_MS:
+                    if (param_val > 60000U) {
+                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+                        return;
+                    }
+                    state->p3_phys_ms = param_val;
+                    break;
+                case CP_P3_FUNC_MS:
+                    if (param_val > 60000U) {
+                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+                        return;
+                    }
+                    state->p3_func_ms = param_val;
+                    break;
                 default:
                     emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
                     return;
@@ -415,12 +619,19 @@ void dpdu_engine_process_cmd(
             uint32_t param_val = 0;
 
             switch (param_id) {
-                case CP_CAN_PHYS_REQ_ID:  param_val = state->can_req_id;     break;
-                case CP_CAN_RESP_USDT_ID: param_val = state->can_resp_id;    break;
-                case CP_P2_MAX_MS:        param_val = state->p2_max_ms;      break;
-                case CP_P2_STAR_MS:       param_val = state->p2_star_ms;     break;
-                case CP_ISOTP_BS:         param_val = state->isotp_bs;       break;
-                case CP_ISOTP_STMIN_MS:   param_val = state->isotp_stmin_ms; break;
+                case CP_BAUDRATE:         param_val = state->baudrate_bps;    break;
+                case CP_CAN_PHYS_REQ_ID:  param_val = state->can_req_id;      break;
+                case CP_CAN_RESP_USDT_ID: param_val = state->can_resp_id;     break;
+                case CP_ADDRESSING_TYPE:  param_val = state->addressing_type; break;
+                case CP_CAN_FILLER_BYTE:  param_val = state->can_filler_byte; break;
+                case CP_BLOCK_SIZE:       param_val = state->isotp_bs;        break;
+                case CP_ST_MIN:           param_val = state->isotp_stmin;     break;
+                case CP_N_BS_MS:          param_val = state->isotp_n_bs_ms;   break;
+                case CP_N_CR_MS:          param_val = state->isotp_n_cr_ms;   break;
+                case CP_P2_MAX_MS:        param_val = state->p2_max_ms;       break;
+                case CP_P2_STAR_MS:       param_val = state->p2_star_ms;      break;
+                case CP_P3_PHYS_MS:       param_val = state->p3_phys_ms;      break;
+                case CP_P3_FUNC_MS:       param_val = state->p3_func_ms;      break;
                 default:
                     emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
                     return;
@@ -438,7 +649,7 @@ void dpdu_engine_process_cmd(
             uint32_t uptime_ms = (uint32_t)(esp_timer_get_time() / 1000LL);
             stat[0] = state->connected ? 1U : 0U;
             stat[1] = state->bus_mode;
-            write_u16_le(&stat[2], state->baud_khz);
+            write_u16_le(&stat[2], (uint16_t)(state->baudrate_bps / 1000U));
             write_u32_le(&stat[4], state->rx_cmd_count);
             write_u32_le(&stat[8], state->crc_err_count);
             write_u32_le(&stat[12], uptime_ms);
