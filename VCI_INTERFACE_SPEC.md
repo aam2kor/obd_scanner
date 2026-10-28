@@ -73,7 +73,7 @@ All multi-byte integers on the wire are **Little-Endian** (`<H` for `uint16`, `<
   - `0x00` `PDU_STATUS_NOERROR` — Command accepted
   - `0x01` `PDU_STATUS_INVALID_ARG` — Out-of-range parameter or malformed payload
   - `0x02` `PDU_STATUS_NOT_CONN` — `PDU_CMD_START_COP` sent while Logical Link is disconnected
-  - `0x03` `PDU_STATUS_BUSY` — VCI busy
+  - `0x03` `PDU_STATUS_BUSY` — Command queue (`16` slots) is full; retry after receiving a `PDU_EVT_RESULT` or `PDU_EVT_ERROR`
   - `0x04` `PDU_STATUS_UNSUPPORTED` — Unknown command opcode
 - **`PDU_EVT_ERROR` Error Codes:**
   - `0x01` `PDU_ERR_P2_TIMEOUT` — No ECU response within `CP_P2_MAX_MS` (or `CP_P2_STAR_MS`)
@@ -81,7 +81,7 @@ All multi-byte integers on the wire are **Little-Endian** (`<H` for `uint16`, `<
   - `0x03` `PDU_ERR_CAN_BUS_OFF` — CAN transmit / bus-off error
   - `0x04` `PDU_ERR_CRC_MISMATCH` — Host command frame failed CRC-16 check
   - `0x05` `PDU_ERR_MALFORMED_FRAME` — Invalid header or ISO-TP sequence number (`SN`) error
-  - `0x06` `PDU_ERR_CANCELLED` — Active ComPrimitive aborted via `PDU_CMD_CANCEL_COP`
+  - `0x06` `PDU_ERR_CANCELLED` — Active or queued ComPrimitive aborted via `PDU_CMD_CANCEL_COP`
 
 ---
 
@@ -126,6 +126,20 @@ All ComParams use `uint32` (`<I`) values in `PDU_CMD_SET_COMPARAM` (`0x03`) and 
    - Send `PDU_CMD_START_COP` (`0x04`) with payload `01 00 09 02`.
    - VCI transmits `02 09 02 CC CC CC CC CC`, receives First Frame (`FF`), automatically transmits physical Flow Control (`30 00 00 CC CC CC CC CC`), reassembles all Consecutive Frames (`CF`), and emits **one** `PDU_EVT_RESULT` (`0x81`) containing the 20-byte PDU `49 02 01 <17-byte ASCII VIN>`.
 
+### 5.1 Asynchronous Pipelining, Queue Depth & Cancel Behavior
+The VCI supports full **asynchronous pipelining** so a PC application can burst multiple PIDs without waiting for each Bluetooth LE / UART round-trip:
+- **Queue Depth:**
+  - **Command Queue (`s_q_dpdu_cmd`):** **`16` commands** (`VCI_CMD_QUEUE_DEPTH = 16`, plus 1 command actively executing on Core 1 = up to **17 in-flight requests**).
+  - **Event Queue (`s_q_dpdu_evt`):** **`32` events** (`VCI_EVT_QUEUE_DEPTH = 32`).
+- **Immediate Queue-Admission `PDU_EVT_CMD_ACK` (`< 1 ms` on Core 0):**
+  - When the PC sends `PDU_CMD_START_COP`, Core 0 immediately validates the command and emits `PDU_EVT_CMD_ACK(PDU_STATUS_NOERROR)` as soon as the command is admitted into `s_q_dpdu_cmd`, **before** previous CAN transactions finish on Core 1.
+  - Core 1 then executes each queued `PDU_CMD_START_COP` strictly in FIFO order, enforcing `CP_P3_PHYS_MS` / `CP_P3_FUNC_MS` inter-request spacing, and emits `PDU_EVT_RESULT` (or `PDU_EVT_ERROR`) tagged with the matching `SeqTag`.
+- **Backpressure (`PDU_STATUS_BUSY = 0x03`):**
+  - If all 16 queue slots are full, Core 0 does **not** silently drop the frame; it immediately replies with `PDU_EVT_CMD_ACK(PDU_STATUS_BUSY)` for that `SeqTag`.
+- **Out-of-Band Priority `PDU_CMD_CANCEL_COP` (`0x05`) & Queue Drain:**
+  - `PDU_CMD_CANCEL_COP` bypasses the 16-slot command queue on Core 0 (`s_cancel_requested = true`).
+  - Core 1 aborts any active CAN/ISO-TP wait or `P3` delay within `<= 5 ms`, drains all queued `PDU_CMD_START_COP` commands in `s_q_dpdu_cmd` by emitting `PDU_EVT_ERROR(PDU_ERR_CANCELLED)` for each queued `SeqTag`, and finally emits `PDU_EVT_CMD_ACK(PDU_CMD_CANCEL_COP)`.
+
 > **Reference Implementation:** See [`pc_app/dpdu_client.py`](file:///home/abey/Documents/obd_scanner/pc_app/dpdu_client.py) and [`pc_app/obd_scanner_app.py`](file:///home/abey/Documents/obd_scanner/pc_app/obd_scanner_app.py) for complete Python Serial and `bleak` Bluetooth LE client implementations.
 
 ---
@@ -137,17 +151,17 @@ Measured from the compiled ESP-IDF 6.1.0 release ELF/object files (`.pio/build/e
 ### 6.1 Core VCI & Lean D-PDU Stack Breakdown
 | Firmware Module | Source File | Flash (`.text` + `.data`) | Static RAM (`.bss` + `.data`) | Responsibility |
 | :--- | :--- | ---: | ---: | :--- |
-| **Lean D-PDU Engine** | [`src/dpdu_protocol.c`](file:///home/abey/Documents/obd_scanner/src/dpdu_protocol.c) | **4,081 B** (`3.99 KB`) | **2,090 B** (`2.04 KB`) | Binary parser, CRC-16, 13 ComParams, `P2`/`P2*`/`P3` timers |
+| **Lean D-PDU Engine** | [`src/dpdu_protocol.c`](file:///home/abey/Documents/obd_scanner/src/dpdu_protocol.c) | **4,132 B** (`4.04 KB`) | **2,090 B** (`2.04 KB`) | Binary parser, CRC-16, 13 ComParams, `P2`/`P2*`/`P3` timers |
 | **ISO 15765-2 (ISO-TP)** | [`src/isotp.c`](file:///home/abey/Documents/obd_scanner/src/isotp.c) | **1,550 B** (`1.51 KB`) | **0 B** *(in `dpdu` ctx)* | Bidirectional `SF`/`FF`/`FC`/`CF` + 11/29-bit addressing |
 | **CAN Classic HAL** | [`src/can_hal.c`](file:///home/abey/Documents/obd_scanner/src/can_hal.c) | **1,234 B** (`1.21 KB`) | **11 B** | ESP32 TWAI driver wrapper & loopback queues |
 | **BLE GATT NUS Server** | [`src/ble_nus.c`](file:///home/abey/Documents/obd_scanner/src/ble_nus.c) | **2,513 B** (`2.45 KB`) | **106 B** | NimBLE peripheral & Nordic UART Service |
-| **Dual-Core Host I/O & RT** | [`src/main.c`](file:///home/abey/Documents/obd_scanner/src/main.c) | **2,323 B** (`2.27 KB`) | **2,846 B** (`2.78 KB`) | FreeRTOS task isolation & UART0/BLE mux |
+| **Dual-Core Host I/O & RT** | [`src/main.c`](file:///home/abey/Documents/obd_scanner/src/main.c) | **2,309 B** (`2.25 KB`) | **3,365 B** (`3.29 KB`) | FreeRTOS async admission, out-of-band cancel & UART/BLE mux |
 | **Status LED Driver** | [`src/led_status.c`](file:///home/abey/Documents/obd_scanner/src/led_status.c) | **377 B** (`0.37 KB`) | **12 B** | `GPIO 2` state indicator |
 | **Virtual ECU Simulator** | [`src/ecu_sim.c`](file:///home/abey/Documents/obd_scanner/src/ecu_sim.c) | **2,757 B** (`2.69 KB`) | **543 B** (`0.53 KB`) | On-chip OBD-II/UDS simulator for loopback test |
-| **Total Custom VCI Stack** | *(All 7 modules above)* | **14,835 B (`14.49 KB`)** | **5,608 B (`5.48 KB`)** | **Complete VCI + D-PDU + ISO-TP + Sim** |
+| **Total Custom VCI Stack** | *(All 7 modules above)* | **14,872 B (`14.52 KB`)** | **6,127 B (`5.98 KB`)** | **Complete VCI + D-PDU + ISO-TP + Sim** |
 
 ### 6.2 Total ESP32 Firmware Image (Including ESP-IDF + FreeRTOS + NimBLE BLE Stack)
-- **Pure Lean D-PDU + ISO-TP Core (`dpdu_protocol.c` + `isotp.c`):** **`5.50 KB` Flash** and **`2.04 KB` static RAM**.
+- **Pure Lean D-PDU + ISO-TP Core (`dpdu_protocol.c` + `isotp.c`):** **`5.55 KB` Flash** and **`2.04 KB` static RAM** (plus **`25.5 KB` FreeRTOS heap** allocated at boot for the 16-deep command queue and 32-deep event queue).
 - **Total Firmware Image (with ESP-IDF RTOS + NimBLE Bluetooth LE Controller/Host):**
-  - **Flash Used:** `496,269 bytes` (**`484.6 KB`**, or **`47.3%`** of the 1 MB factory app partition on the 4 MB flash).
-  - **Static RAM Used:** `32,724 bytes` (**`31.96 KB`**, or **`10.0%`** of the 320 KB ESP32 DRAM, leaving **~`288 KB`** of free RAM/heap).
+  - **Flash Used:** `495,893 bytes` (**`484.3 KB`**, or **`47.3%`** of the 1 MB factory app partition on the 4 MB flash).
+  - **Static RAM Used:** `33,244 bytes` (**`32.46 KB`**, or **`10.1%`** of the 320 KB ESP32 DRAM, leaving **~`262 KB`** of free RAM/heap after queue allocation).

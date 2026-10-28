@@ -1,7 +1,8 @@
 /**
  * @file main.c
- * @brief ESP32 OBD-II VCI — Step 4: Dual-Transport (BLE NimBLE NUS + USB-UART0),
- *        Lean D-PDU API, Multi-Frame ISO 15765-2 (FF/FC/CF), P2/P2* Timers & CAN HAL.
+ * @brief ESP32 OBD-II VCI — Step 4+: Dual-Transport (BLE NimBLE NUS + USB-UART0),
+ *        Pipelined Asynchronous Queue Admission, Out-of-Band Cancel & Drain,
+ *        13-ComParam Lean D-PDU API, and Multi-Frame ISO 15765-2 (FF/FC/CF).
  *
  * Core 0 (PRO_CPU): BLE NimBLE Host/Controller + Host I/O Task (UART0 + BLE NUS) + Status LED
  * Core 1 (APP_CPU): Real-Time VCI Task (Lean D-PDU + ISO-TP + CAN HAL) + Virtual ECU Task
@@ -29,6 +30,10 @@ static QueueHandle_t s_q_dpdu_evt = NULL;
 static dpdu_vci_state_t s_vci_state;
 static dpdu_rx_parser_t s_ble_parser;
 
+/* Out-of-band priority cancel state set by Core 0 and serviced by Core 1 */
+static volatile bool s_cancel_requested = false;
+static dpdu_frame_t  s_cancel_cmd;
+
 /**
  * @brief Transmit a D-PDU frame over both Host USB-UART0 and BLE NUS (when connected).
  */
@@ -51,17 +56,98 @@ static void vci_emit_evt(const dpdu_frame_t *evt)
     }
 }
 
+/**
+ * @brief Non-blocking cancel check hook invoked by Core 1 during active CAN / P3 waits.
+ */
 static bool vci_check_cancel(dpdu_frame_t *out_cancel_cmd)
 {
-    dpdu_frame_t peek_frame;
-    if (s_q_dpdu_cmd != NULL && xQueuePeek(s_q_dpdu_cmd, &peek_frame, 0) == pdTRUE) {
-        if (peek_frame.opcode == PDU_CMD_CANCEL_COP) {
-            xQueueReceive(s_q_dpdu_cmd, out_cancel_cmd, 0);
-            s_vci_state.rx_cmd_count++;
-            return true;
+    if (s_cancel_requested) {
+        if (out_cancel_cmd != NULL) {
+            *out_cancel_cmd = s_cancel_cmd;
         }
+        return true;
     }
     return false;
+}
+
+/**
+ * @brief Drain any queued PDU_CMD_START_COP frames on cancel and emit PDU_EVT_CMD_ACK for CANCEL_COP.
+ */
+static void vci_service_pending_cancel(void)
+{
+    if (!s_cancel_requested) {
+        return;
+    }
+    dpdu_frame_t cancel_copy = s_cancel_cmd;
+    s_cancel_requested = false;
+    s_vci_state.rx_cmd_count++;
+
+    /* Drain any queued ComPrimitives in s_q_dpdu_cmd so no async host futures hang */
+    dpdu_frame_t q_cmd;
+    while (xQueueReceive(s_q_dpdu_cmd, &q_cmd, 0) == pdTRUE) {
+        if (q_cmd.opcode == PDU_CMD_START_COP) {
+            s_vci_state.rx_cmd_count++;
+            uint8_t sid = (q_cmd.length >= 3U) ? q_cmd.payload[2] : 0U;
+            dpdu_frame_t err_evt;
+            dpdu_build_error_frame(&err_evt, &q_cmd, PDU_ERR_CANCELLED, sid);
+            vci_emit_evt(&err_evt);
+        } else {
+            dpdu_engine_process_cmd(&s_vci_state, &q_cmd, vci_emit_evt);
+        }
+    }
+
+    s_vci_state.next_allowed_tx_us = 0LL;
+
+    dpdu_frame_t ack_evt;
+    dpdu_build_ack_frame(&ack_evt, &cancel_copy, PDU_STATUS_NOERROR);
+    vci_emit_evt(&ack_evt);
+}
+
+/**
+ * @brief Core 0 Queue Admission & Immediate ACK logic for parsed Host D-PDU commands.
+ */
+static void host_admit_command(const dpdu_frame_t *cmd)
+{
+    /* 1. Out-of-band priority handling for PDU_CMD_CANCEL_COP */
+    if (cmd->opcode == PDU_CMD_CANCEL_COP) {
+        s_cancel_cmd = *cmd;
+        s_cancel_requested = true;
+        return;
+    }
+
+    /* 2. Immediate queue-admission validation & ACK for PDU_CMD_START_COP */
+    if (cmd->opcode == PDU_CMD_START_COP) {
+        uint8_t status = dpdu_validate_start_cop(&s_vci_state, cmd);
+        if (status != PDU_STATUS_NOERROR) {
+            s_vci_state.rx_cmd_count++;
+            dpdu_frame_t nack;
+            dpdu_build_ack_frame(&nack, cmd, status);
+            vci_emit_evt(&nack);
+            return;
+        }
+
+        if (xQueueSend(s_q_dpdu_cmd, cmd, 0) == pdTRUE) {
+            /* Admitted into the 16-slot hardware command queue: emit immediate CMD_ACK */
+            dpdu_frame_t ack;
+            dpdu_build_ack_frame(&ack, cmd, PDU_STATUS_NOERROR);
+            vci_emit_evt(&ack);
+        } else {
+            /* Command queue full (16 commands already waiting): emit explicit PDU_STATUS_BUSY */
+            s_vci_state.rx_cmd_count++;
+            dpdu_frame_t busy_ack;
+            dpdu_build_ack_frame(&busy_ack, cmd, PDU_STATUS_BUSY);
+            vci_emit_evt(&busy_ack);
+        }
+        return;
+    }
+
+    /* 3. Control commands (CONNECT, DISCONNECT, SET_COMPARAM, GET_COMPARAM, GET_STATUS) */
+    if (xQueueSend(s_q_dpdu_cmd, cmd, 0) != pdTRUE) {
+        s_vci_state.rx_cmd_count++;
+        dpdu_frame_t busy_ack;
+        dpdu_build_ack_frame(&busy_ack, cmd, PDU_STATUS_BUSY);
+        vci_emit_evt(&busy_ack);
+    }
 }
 
 /**
@@ -72,25 +158,16 @@ static void on_ble_nus_rx(const uint8_t *data, size_t len)
     for (size_t i = 0; i < len; i++) {
         dpdu_parse_result_t res = dpdu_parser_feed_byte(&s_ble_parser, data[i]);
         if (res == DPDU_PARSE_OK) {
-            xQueueSend(s_q_dpdu_cmd, &s_ble_parser.frame, pdMS_TO_TICKS(50));
+            host_admit_command(&s_ble_parser.frame);
         } else if (res == DPDU_PARSE_ERR_CRC) {
             s_vci_state.crc_err_count++;
-            dpdu_frame_t err_evt = {
-                .opcode  = PDU_EVT_ERROR,
-                .handle  = s_ble_parser.frame.handle,
-                .seq_tag = s_ble_parser.frame.seq_tag,
-                .length  = 2U,
-                .payload = { PDU_ERR_CRC_MISMATCH, s_ble_parser.frame.opcode },
-            };
+            dpdu_frame_t err_evt;
+            dpdu_build_error_frame(&err_evt, &s_ble_parser.frame, PDU_ERR_CRC_MISMATCH, s_ble_parser.frame.opcode);
             vci_emit_evt(&err_evt);
         } else if (res == DPDU_PARSE_ERR_HDR) {
-            dpdu_frame_t err_evt = {
-                .opcode  = PDU_EVT_ERROR,
-                .handle  = 0U,
-                .seq_tag = 0U,
-                .length  = 2U,
-                .payload = { PDU_ERR_MALFORMED_FRAME, 0U },
-            };
+            dpdu_frame_t dummy = {0};
+            dpdu_frame_t err_evt;
+            dpdu_build_error_frame(&err_evt, &dummy, PDU_ERR_MALFORMED_FRAME, 0U);
             vci_emit_evt(&err_evt);
         }
     }
@@ -98,7 +175,7 @@ static void on_ble_nus_rx(const uint8_t *data, size_t len)
 
 /**
  * @brief Core 0 Task: Reads raw bytes from Host (UART0), runs the 0xA5 + CRC-16
- *        stream parser, forwards valid commands to Core 1 via s_q_dpdu_cmd, and
+ *        stream parser, admits valid commands via host_admit_command(), and
  *        transmits outgoing events from s_q_dpdu_evt to UART0 and BLE NUS.
  */
 static void host_io_task(void *arg)
@@ -121,25 +198,16 @@ static void host_io_task(void *arg)
         for (int i = 0; i < rx_len; i++) {
             dpdu_parse_result_t res = dpdu_parser_feed_byte(&uart_parser, rx_chunk[i]);
             if (res == DPDU_PARSE_OK) {
-                xQueueSend(s_q_dpdu_cmd, &uart_parser.frame, pdMS_TO_TICKS(50));
+                host_admit_command(&uart_parser.frame);
             } else if (res == DPDU_PARSE_ERR_CRC) {
                 s_vci_state.crc_err_count++;
-                dpdu_frame_t err_evt = {
-                    .opcode  = PDU_EVT_ERROR,
-                    .handle  = uart_parser.frame.handle,
-                    .seq_tag = uart_parser.frame.seq_tag,
-                    .length  = 2U,
-                    .payload = { PDU_ERR_CRC_MISMATCH, uart_parser.frame.opcode },
-                };
+                dpdu_frame_t err_evt;
+                dpdu_build_error_frame(&err_evt, &uart_parser.frame, PDU_ERR_CRC_MISMATCH, uart_parser.frame.opcode);
                 host_send_frame(&err_evt);
             } else if (res == DPDU_PARSE_ERR_HDR) {
-                dpdu_frame_t err_evt = {
-                    .opcode  = PDU_EVT_ERROR,
-                    .handle  = 0U,
-                    .seq_tag = 0U,
-                    .length  = 2U,
-                    .payload = { PDU_ERR_MALFORMED_FRAME, 0U },
-                };
+                dpdu_frame_t dummy = {0};
+                dpdu_frame_t err_evt;
+                dpdu_build_error_frame(&err_evt, &dummy, PDU_ERR_MALFORMED_FRAME, 0U);
                 host_send_frame(&err_evt);
             }
         }
@@ -151,7 +219,7 @@ static void host_io_task(void *arg)
 }
 
 /**
- * @brief Core 1 Task: Real-time VCI engine processing D-PDU commands, ISO-TP, and P2/P2* timers.
+ * @brief Core 1 Task: Real-time VCI engine processing D-PDU commands, ISO-TP, and P2/P2_Star/P3 timers.
  */
 static void vci_rt_task(void *arg)
 {
@@ -159,8 +227,14 @@ static void vci_rt_task(void *arg)
     static dpdu_frame_t cmd_frame;
 
     while (1) {
+        if (s_cancel_requested) {
+            vci_service_pending_cancel();
+        }
         if (xQueueReceive(s_q_dpdu_cmd, &cmd_frame, pdMS_TO_TICKS(10)) == pdTRUE) {
             dpdu_engine_process_cmd(&s_vci_state, &cmd_frame, vci_emit_evt);
+            if (s_cancel_requested) {
+                vci_service_pending_cancel();
+            }
         }
     }
 }
@@ -188,7 +262,7 @@ static void host_uart_init(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting ESP32 OBD-II VCI (Step 4: BLE NimBLE NUS + USB-UART0 + ISO-TP)...");
+    ESP_LOGI(TAG, "Starting ESP32 OBD-II VCI (Step 4+: Async Queue Admission + BLE NUS + ISO-TP)...");
 
     dpdu_engine_init(&s_vci_state);
     dpdu_engine_set_cancel_checker(vci_check_cancel);

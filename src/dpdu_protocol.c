@@ -181,6 +181,43 @@ void dpdu_engine_init(dpdu_vci_state_t *state)
     state->next_allowed_tx_us = 0LL;
 }
 
+void dpdu_build_ack_frame(dpdu_frame_t *out_ack, const dpdu_frame_t *cmd, uint8_t status)
+{
+    memset(out_ack, 0, sizeof(*out_ack));
+    out_ack->opcode     = PDU_EVT_CMD_ACK;
+    out_ack->handle     = cmd->handle;
+    out_ack->seq_tag    = cmd->seq_tag;
+    out_ack->length     = 2U;
+    out_ack->payload[0] = cmd->opcode;
+    out_ack->payload[1] = status;
+}
+
+void dpdu_build_error_frame(dpdu_frame_t *out_err, const dpdu_frame_t *cmd, uint8_t err_code, uint8_t detail)
+{
+    memset(out_err, 0, sizeof(*out_err));
+    out_err->opcode     = PDU_EVT_ERROR;
+    out_err->handle     = cmd->handle;
+    out_err->seq_tag    = cmd->seq_tag;
+    out_err->length     = 2U;
+    out_err->payload[0] = err_code;
+    out_err->payload[1] = detail;
+}
+
+uint8_t dpdu_validate_start_cop(const dpdu_vci_state_t *state, const dpdu_frame_t *cmd)
+{
+    if (!state->connected) {
+        return PDU_STATUS_NOT_CONN;
+    }
+    if (cmd->length < 3U) {
+        return PDU_STATUS_INVALID_ARG;
+    }
+    uint8_t cop_type = cmd->payload[0];
+    if (cop_type != PDU_COPT_SENDRECV && cop_type != PDU_COPT_SEND_ONLY) {
+        return PDU_STATUS_INVALID_ARG;
+    }
+    return PDU_STATUS_NOERROR;
+}
+
 static void emit_ack(
     dpdu_emit_evt_fn_t emit_fn,
     const dpdu_frame_t *cmd,
@@ -190,17 +227,10 @@ static void emit_ack(
 )
 {
     static dpdu_frame_t rsp;
-    memset(&rsp, 0, sizeof(rsp));
-    rsp.opcode  = PDU_EVT_CMD_ACK;
-    rsp.handle  = cmd->handle;
-    rsp.seq_tag = cmd->seq_tag;
-    rsp.payload[0] = cmd->opcode;
-    rsp.payload[1] = status;
+    dpdu_build_ack_frame(&rsp, cmd, status);
     if (extra != NULL && extra_len > 0 && (2U + extra_len) <= DPDU_MAX_PAYLOAD) {
         memcpy(&rsp.payload[2], extra, extra_len);
         rsp.length = 2U + extra_len;
-    } else {
-        rsp.length = 2U;
     }
     emit_fn(&rsp);
 }
@@ -261,21 +291,20 @@ static bool is_valid_baudrate_bps(uint32_t *inout_baud)
 
 static void enforce_p3_inter_request_delay(dpdu_vci_state_t *state)
 {
-    int64_t now_us = esp_timer_get_time();
-    if (now_us >= state->next_allowed_tx_us) {
-        return;
-    }
-
-    int64_t wait_us = state->next_allowed_tx_us - now_us;
-    if (wait_us >= 10000LL) {
-        TickType_t ticks = pdMS_TO_TICKS((uint32_t)(wait_us / 1000LL));
-        if (ticks > 0) {
-            vTaskDelay(ticks);
+    while (esp_timer_get_time() < state->next_allowed_tx_us) {
+        if (s_cancel_check_fn != NULL && s_cancel_check_fn(NULL)) {
+            return;
         }
-    }
-    now_us = esp_timer_get_time();
-    if (now_us < state->next_allowed_tx_us) {
-        esp_rom_delay_us((uint32_t)(state->next_allowed_tx_us - now_us));
+        int64_t wait_us = state->next_allowed_tx_us - esp_timer_get_time();
+        if (wait_us <= 0) {
+            break;
+        }
+        if (wait_us >= 10000LL) {
+            vTaskDelay(1);
+        } else {
+            esp_rom_delay_us((uint32_t)wait_us);
+            break;
+        }
     }
 }
 
@@ -316,31 +345,34 @@ static void execute_start_cop(
     dpdu_emit_evt_fn_t emit_fn
 )
 {
-    if (!state->connected) {
-        emit_ack(emit_fn, cmd, PDU_STATUS_NOT_CONN, NULL, 0);
-        return;
-    }
-    if (cmd->length < 3U) {
-        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+    /* Validate state in case link was disconnected while command was queued */
+    uint8_t val_status = dpdu_validate_start_cop(state, cmd);
+    if (val_status != PDU_STATUS_NOERROR) {
+        emit_error(emit_fn, cmd, PDU_ERR_CAN_BUS_OFF, val_status);
         return;
     }
 
     uint8_t cop_type       = cmd->payload[0];
     const uint8_t *pdu_req = &cmd->payload[2];
     uint16_t pdu_req_len   = cmd->length - 2U;
+    uint8_t req_sid        = pdu_req[0];
 
-    if (cop_type != PDU_COPT_SENDRECV && cop_type != PDU_COPT_SEND_ONLY) {
-        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
+    /* Check if cancel was requested before starting CAN transmission */
+    if (s_cancel_check_fn != NULL && s_cancel_check_fn(NULL)) {
+        emit_error(emit_fn, cmd, PDU_ERR_CANCELLED, req_sid);
         return;
     }
 
-    /* 1. Acknowledge ComPrimitive acceptance */
-    emit_ack(emit_fn, cmd, PDU_STATUS_NOERROR, NULL, 0);
-
-    /* 2. Enforce CP_P3_PHYS_MS / CP_P3_FUNC_MS inter-request timing before transmitting */
+    /* 1. Enforce CP_P3_PHYS_MS / CP_P3_FUNC_MS inter-request timing before transmitting */
     enforce_p3_inter_request_delay(state);
 
-    /* 3. Build ISO-TP Configuration from the 13-ComParam Table */
+    /* Re-check cancel after P3 delay */
+    if (s_cancel_check_fn != NULL && s_cancel_check_fn(NULL)) {
+        emit_error(emit_fn, cmd, PDU_ERR_CANCELLED, req_sid);
+        return;
+    }
+
+    /* 2. Build ISO-TP Configuration from the 13-ComParam Table */
     isotp_config_t isotp_cfg = {
         .can_req_id      = state->can_req_id,
         .can_resp_id     = state->can_resp_id,
@@ -352,7 +384,7 @@ static void execute_start_cop(
         .n_cr_ms         = state->isotp_n_cr_ms,
     };
 
-    /* 4. Transmit PDU over ISO-TP / CAN HAL */
+    /* 3. Transmit PDU over ISO-TP / CAN HAL (PDU_EVT_CMD_ACK was already emitted on Core 0 admission) */
     int64_t t_start_us = esp_timer_get_time();
     esp_err_t tx_err = isotp_send_pdu(&isotp_cfg, pdu_req, pdu_req_len);
     if (tx_err != ESP_OK) {
@@ -366,22 +398,17 @@ static void execute_start_cop(
         return;
     }
 
-    /* 5. Wait for ECU response within CP_P2_MAX_MS (or CP_P2_STAR_MS on NRC 0x78, or CP_N_CR_MS during Multi-Frame) */
-    uint8_t req_sid = pdu_req[0];
+    /* 4. Wait for ECU response within CP_P2_MAX_MS (or CP_P2_STAR_MS on NRC 0x78, or CP_N_CR_MS during Multi-Frame) */
     int64_t deadline_us = esp_timer_get_time() + ((int64_t)state->p2_max_ms * 1000LL);
     vci_can_frame_t rx_frame;
     static isotp_rx_ctx_t rx_ctx;
     isotp_rx_init(&rx_ctx);
 
     while (esp_timer_get_time() < deadline_us) {
-        /* Check if Host sent PDU_CMD_CANCEL_COP while ComPrimitive is in flight */
-        if (s_cancel_check_fn != NULL) {
-            dpdu_frame_t cancel_cmd;
-            if (s_cancel_check_fn(&cancel_cmd)) {
-                emit_ack(emit_fn, &cancel_cmd, PDU_STATUS_NOERROR, NULL, 0);
-                emit_error(emit_fn, cmd, PDU_ERR_CANCELLED, req_sid);
-                return;
-            }
+        /* Check if Host sent out-of-band PDU_CMD_CANCEL_COP while ComPrimitive is in flight */
+        if (s_cancel_check_fn != NULL && s_cancel_check_fn(NULL)) {
+            emit_error(emit_fn, cmd, PDU_ERR_CANCELLED, req_sid);
+            return;
         }
 
         int64_t rem_us = deadline_us - esp_timer_get_time();

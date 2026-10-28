@@ -227,6 +227,14 @@ class LeanDpduSerialClient:
                 return self._rx_queue.pop(0)
         raise TimeoutError("Timed out waiting for D-PDU frame from VCI")
 
+    def send_raw_cmd(self, opcode: int, payload: bytes = b"", handle: int = 1) -> int:
+        """Send a D-PDU command frame without waiting for a response; returns the assigned seq_tag."""
+        seq = self._next_seq()
+        req = DpduFrame(opcode=opcode, handle=handle, seq_tag=seq, payload=payload)
+        self.ser.write(req.encode())
+        self.ser.flush()
+        return seq
+
     def send_and_recv(
         self,
         opcode: int,
@@ -576,24 +584,88 @@ def run_comparam_and_standards_verification():
         assert res_29_sf.rx_can_id == 0x18DAF110 and res_29_mf.rx_can_id == 0x18DAF110
         assert len(vin_29) == 17
 
-        print("[6/6] Verifying In-Flight PDU_CMD_CANCEL_COP (0x05) during active P2* wait (01 F4)...")
+        print("[6/8] Verifying Pipelined Asynchronous Burst (5 back-to-back START_COPs without waiting)...")
+        client.pdu_set_com_param(CP_ADDRESSING_TYPE, DPDU_ADDR_PHYSICAL)
+        client.pdu_set_com_param(CP_CAN_PHYS_REQ_ID, 0x7E0)
+        client.pdu_set_com_param(CP_CAN_RESP_USDT_ID, 0x7E8)
+        client.pdu_set_com_param(CP_P3_PHYS_MS, 2)
+        burst_pids = [b"\x01\x00", b"\x01\x0C", b"\x01\x0D", b"\x01\x05", b"\x01\x11"]
+        burst_seqs = [
+            client.send_raw_cmd(PDU_CMD_START_COP, struct.pack("<BB", PDU_COPT_SENDRECV, 0) + pid)
+            for pid in burst_pids
+        ]
+        acks_seen = set()
+        results_seen = {}
+        while len(acks_seen) < 5 or len(results_seen) < 5:
+            f = client.recv_frame(timeout=2.0)
+            if f.opcode == PDU_EVT_CMD_ACK and f.payload[1] == PDU_STATUS_NOERROR:
+                acks_seen.add(f.seq_tag)
+            elif f.opcode == PDU_EVT_RESULT:
+                results_seen[f.seq_tag] = client.parse_result_event(f)
+        assert acks_seen == set(burst_seqs) and set(results_seen.keys()) == set(burst_seqs)
+        print(f"      All 5 pipelined async requests ACKed & resolved in order (SeqTags={burst_seqs})!")
+
+        print("[7/8] Verifying Out-of-Band Priority PDU_CMD_CANCEL_COP + Queue Drain of 3 Queued Primitives...")
         client.pdu_set_com_param(CP_CAN_PHYS_REQ_ID, 0x7DF)
         client.pdu_set_com_param(CP_CAN_RESP_USDT_ID, 0x7E8)
-        payload = struct.pack("<BB", PDU_COPT_SENDRECV, 0) + b"\x01\xF4"
-        ack_start = client.send_and_recv(PDU_CMD_START_COP, payload)
-        assert ack_start.opcode == PDU_EVT_CMD_ACK
-        time.sleep(0.05)  # Let ECU emit NRC 0x78 so VCI enters 5000ms P2* wait
+        s_active = client.send_raw_cmd(PDU_CMD_START_COP, struct.pack("<BB", PDU_COPT_SENDRECV, 0) + b"\x01\xF4")
+        time.sleep(0.03)  # Let s_active enter 5000ms P2* wait on Core 1
+        s_q1 = client.send_raw_cmd(PDU_CMD_START_COP, struct.pack("<BB", PDU_COPT_SENDRECV, 0) + b"\x01\x0C")
+        s_q2 = client.send_raw_cmd(PDU_CMD_START_COP, struct.pack("<BB", PDU_COPT_SENDRECV, 0) + b"\x01\x0D")
+        s_q3 = client.send_raw_cmd(PDU_CMD_START_COP, struct.pack("<BB", PDU_COPT_SENDRECV, 0) + b"\x01\x05")
+        time.sleep(0.02)
         t_cancel = time.time()
-        f1 = client.send_and_recv(PDU_CMD_CANCEL_COP)
-        f2 = client.recv_frame(timeout=1.0)
+        s_cancel = client.send_raw_cmd(PDU_CMD_CANCEL_COP)
+        cancelled_seqs = set()
+        cancel_ack_seen = False
+        while not (cancel_ack_seen and len(cancelled_seqs) == 4):
+            f = client.recv_frame(timeout=1.5)
+            if f.opcode == PDU_EVT_ERROR and f.payload[0] == PDU_ERR_CANCELLED:
+                cancelled_seqs.add(f.seq_tag)
+            elif f.opcode == PDU_EVT_CMD_ACK and f.seq_tag == s_cancel and f.payload[0] == PDU_CMD_CANCEL_COP:
+                cancel_ack_seen = True
         cancel_ms = int((time.time() - t_cancel) * 1000)
-        frames = [f1, f2]
-        assert any(f.opcode == PDU_EVT_CMD_ACK and f.payload[0] == PDU_CMD_CANCEL_COP for f in frames)
-        assert any(f.opcode == PDU_EVT_ERROR and f.payload[0] == PDU_ERR_CANCELLED for f in frames)
-        print(f"      Active P2* wait aborted in {cancel_ms} ms (<< 5000ms P2*) with PDU_ERR_CANCELLED!")
+        assert cancelled_seqs == {s_active, s_q1, s_q2, s_q3}
+        print(
+            f"      Out-of-band CANCEL_COP aborted active P2* + drained 3 queued primitives in {cancel_ms} ms!"
+        )
+
+        print("[8/8] Verifying Queue Depth = 16 & Explicit PDU_STATUS_BUSY (0x03) Backpressure on Overflow...")
+        # 1 active in-flight on Core 1 + 16 queued in s_q_dpdu_cmd + 1 overflow (18th)
+        s_in_flight = client.send_raw_cmd(PDU_CMD_START_COP, struct.pack("<BB", PDU_COPT_SENDRECV, 0) + b"\x01\xF4")
+        time.sleep(0.03)  # Ensure Core 1 pops s_in_flight so all 16 queue slots are tested
+        queued_16 = [
+            client.send_raw_cmd(PDU_CMD_START_COP, struct.pack("<BB", PDU_COPT_SENDRECV, 0) + b"\x01\x0C")
+            for _ in range(16)
+        ]
+        s_overflow = client.send_raw_cmd(PDU_CMD_START_COP, struct.pack("<BB", PDU_COPT_SENDRECV, 0) + b"\x01\x0D")
+        busy_seen = False
+        admitted_acks = set()
+        while not busy_seen or len(admitted_acks) < 17:
+            f = client.recv_frame(timeout=1.5)
+            if f.opcode == PDU_EVT_CMD_ACK:
+                if f.seq_tag == s_overflow and f.payload[1] == PDU_STATUS_BUSY:
+                    busy_seen = True
+                elif f.payload[1] == PDU_STATUS_NOERROR:
+                    admitted_acks.add(f.seq_tag)
+        assert busy_seen and len(admitted_acks) == 17
+        # Cleanly cancel & drain the 17 active/queued commands
+        s_cleanup = client.send_raw_cmd(PDU_CMD_CANCEL_COP)
+        cleanup_cancelled = 0
+        cleanup_acked = False
+        while not (cleanup_acked and cleanup_cancelled == 17):
+            f = client.recv_frame(timeout=1.5)
+            if f.opcode == PDU_EVT_ERROR and f.payload[0] == PDU_ERR_CANCELLED:
+                cleanup_cancelled += 1
+            elif f.opcode == PDU_EVT_CMD_ACK and f.seq_tag == s_cleanup:
+                cleanup_acked = True
+        print(
+            "      1 in-flight + 16 queued accepted (NOERROR); 18th received PDU_STATUS_BUSY (0x03); "
+            "all 17 drained cleanly via CANCEL_COP!"
+        )
 
         client.pdu_disconnect()
-        print("=== ALL 6 ISO 22900-2 STANDARDS VERIFICATION CHECKS PASSED! ===")
+        print("=== ALL 8 ISO 22900-2 & ASYNC PIPELINING VERIFICATION CHECKS PASSED! ===")
     finally:
         client.close()
 

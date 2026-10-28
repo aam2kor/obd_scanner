@@ -30,9 +30,9 @@
 #define VCI_PRIO_VCI_RT_TASK    18
 #define VCI_PRIO_ECU_SIM_TASK   19
 
-/* Queue Depths */
-#define VCI_CMD_QUEUE_DEPTH     8
-#define VCI_EVT_QUEUE_DEPTH     8
+/* Queue Depths (16 pending commands; 32 events to hold ACKs + Results/Cancel drains) */
+#define VCI_CMD_QUEUE_DEPTH     16
+#define VCI_EVT_QUEUE_DEPTH     32
 
 #endif /* VCI_CONFIG_H */
 

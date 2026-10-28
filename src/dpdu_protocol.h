@@ -201,6 +201,22 @@ void dpdu_engine_init(dpdu_vci_state_t *state);
 void dpdu_engine_set_cancel_checker(dpdu_check_cancel_fn_t cancel_fn);
 
 /**
+ * @brief Validate a PDU_CMD_START_COP frame prior to queue admission on Core 0.
+ * @return PDU_STATUS_NOERROR if valid and ready to enqueue, else PDU_STATUS_NOT_CONN / PDU_STATUS_INVALID_ARG.
+ */
+uint8_t dpdu_validate_start_cop(const dpdu_vci_state_t *state, const dpdu_frame_t *cmd);
+
+/**
+ * @brief Populate a PDU_EVT_CMD_ACK frame for a given command.
+ */
+void dpdu_build_ack_frame(dpdu_frame_t *out_ack, const dpdu_frame_t *cmd, uint8_t status);
+
+/**
+ * @brief Populate a PDU_EVT_ERROR frame for a given command.
+ */
+void dpdu_build_error_frame(dpdu_frame_t *out_err, const dpdu_frame_t *cmd, uint8_t err_code, uint8_t detail);
+
+/**
  * @brief Process an incoming Host D-PDU command and emit response/event frames.
  */
 void dpdu_engine_process_cmd(
