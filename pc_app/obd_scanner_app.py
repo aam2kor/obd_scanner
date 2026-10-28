@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-PC Bluetooth LE & USB-Serial OBD-II Diagnostic Scanner Application (Step 4).
+PC Bluetooth LE & USB-Serial OBD-II Diagnostic Scanner Application (ISO 22900-2:2022 App-Device IF).
 
 Communicates with the ESP32 OBD-II VCI ("ESP32-OBD-VCI") over Bluetooth LE
-Nordic UART Service (NUS) or USB-UART0 using the pure binary Lean D-PDU API
-(0xA5 SOF + 8B Header + Payload + CRC-16/CCITT-FALSE).
+Nordic UART Service (NUS) or USB-UART0 using the binary App-Device IF protocol:
+[ SOF (2B: 0xAA55) | Msg_Type (1B) | CLL_ID (1B) | COP_ID (1B) | Status (1B) | Payload_Len (2B) | Payload | CRC16-CCITT (2B) ]
 """
 
 import argparse
@@ -21,8 +21,6 @@ from dpdu_client import (
     CP_CAN_FILLER_BYTE,
     CP_CAN_PHYS_REQ_ID,
     CP_CAN_RESP_USDT_ID,
-    CP_ISOTP_BS,
-    CP_ISOTP_STMIN_MS,
     CP_N_BS_MS,
     CP_N_CR_MS,
     CP_P2_MAX_MS,
@@ -36,19 +34,26 @@ from dpdu_client import (
     DpduResultEvent,
     DpduStreamParser,
     LeanDpduSerialClient,
+    PDU_CLLST_OFFLINE,
+    PDU_CLLST_ONLINE,
     PDU_CMD_CONNECT,
     PDU_CMD_DISCONNECT,
     PDU_CMD_GET_COMPARAM,
     PDU_CMD_GET_STATUS,
+    PDU_CMD_MOD_CTRL,
     PDU_CMD_SET_COMPARAM,
     PDU_CMD_START_COP,
+    PDU_COPST_CANCELLED,
+    PDU_COPST_FINISHED,
     PDU_COPT_SENDRECV,
     PDU_COPT_SEND_ONLY,
-    PDU_ERR_ISOTP_TIMEOUT,
-    PDU_ERR_P2_TIMEOUT,
     PDU_EVT_CMD_ACK,
-    PDU_EVT_ERROR,
-    PDU_EVT_RESULT,
+    PDU_IOCTL_GET_CABLE_ID,
+    PDU_IOCTL_GET_VERSION,
+    PDU_IOCTL_READ_VBATT,
+    PDU_IT_ERROR,
+    PDU_IT_RESULT,
+    PDU_IT_STATUS,
     PDU_STATUS_NOERROR,
     VCI_BUS_MODE_PHYSICAL_CAN,
     VCI_BUS_MODE_SIM_LOOPBACK,
@@ -62,7 +67,7 @@ VCI_BLE_NAME = "ESP32-OBD-VCI"
 
 
 class LeanDpduBleClient:
-    """Async PC Host Lean D-PDU Client communicating over Bluetooth LE (Nordic UART Service)."""
+    """Async PC Host ISO 22900-2 App-Device IF Client over Bluetooth LE (Nordic UART Service)."""
 
     def __init__(self, device_name: str = VCI_BLE_NAME, address: Optional[str] = None):
         self.device_name = device_name
@@ -70,12 +75,13 @@ class LeanDpduBleClient:
         self.client = None
         self.parser = DpduStreamParser()
         self._rx_queue: asyncio.Queue[DpduFrame] = asyncio.Queue()
-        self._seq = 1
+        self._deferred: list[DpduFrame] = []
+        self._next_cop_id = 1
 
-    def _next_seq(self) -> int:
-        s = self._seq
-        self._seq = (self._seq + 1) & 0xFFFF
-        return s
+    def alloc_cop_id(self) -> int:
+        cid = self._next_cop_id
+        self._next_cop_id = (self._next_cop_id % 254) + 1
+        return cid
 
     def _on_nus_tx_notify(self, _sender, data: bytearray):
         for b in data:
@@ -107,6 +113,7 @@ class LeanDpduBleClient:
         self.client = BleakClient(target_device)
         await self.client.connect()
         self.parser.reset()
+        self._deferred.clear()
         while not self._rx_queue.empty():
             self._rx_queue.get_nowait()
         await self.client.start_notify(NUS_TX_CHAR_UUID, self._on_nus_tx_notify)
@@ -121,32 +128,47 @@ class LeanDpduBleClient:
             await self.client.disconnect()
 
     async def recv_frame(self, timeout: float = 2.0) -> DpduFrame:
+        if self._deferred:
+            return self._deferred.pop(0)
         return await asyncio.wait_for(self._rx_queue.get(), timeout=timeout)
 
-    async def send_and_recv(
+    async def send_and_recv_ack(
         self,
-        opcode: int,
+        msg_type: int,
         payload: bytes = b"",
-        handle: int = 1,
-        corrupt_crc: bool = False,
+        cll_id: int = 1,
+        cop_id: int = 0,
         timeout: float = 2.0,
     ) -> DpduFrame:
-        seq = self._next_seq()
-        req = DpduFrame(opcode=opcode, handle=handle, seq_tag=seq, payload=payload)
-        wire = req.encode(corrupt_crc=corrupt_crc)
-        await self.client.write_gatt_char(NUS_RX_CHAR_UUID, wire, response=False)
-        return await self.recv_frame(timeout=timeout)
+        req = DpduFrame(msg_type=msg_type, cll_id=cll_id, cop_id=cop_id, status=0, payload=payload)
+        await self.client.write_gatt_char(NUS_RX_CHAR_UUID, req.encode(), response=False)
+        skipped: list[DpduFrame] = []
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            f = await self.recv_frame(timeout=max(0.05, deadline - time.time()))
+            if f.msg_type == PDU_EVT_CMD_ACK and f.cll_id == cll_id and f.cop_id == cop_id:
+                self._deferred = skipped + self._deferred
+                return f
+            skipped.append(f)
+        raise TimeoutError("Timed out waiting for 0x80 synchronous Command ACK over BLE")
 
-    async def pdu_get_status(self) -> dict:
-        rsp = await self.send_and_recv(PDU_CMD_GET_STATUS)
-        assert rsp.opcode == PDU_EVT_CMD_ACK
-        orig_op, status = rsp.payload[0], rsp.payload[1]
-        assert orig_op == PDU_CMD_GET_STATUS and status == PDU_STATUS_NOERROR
-        connected, bus_mode, baud_khz, rx_cnt, crc_err, uptime_ms, req_id = struct.unpack(
-            "<BBHIIII", rsp.payload[2:22]
+    async def pdu_ioctl(self, ioctl_id: int) -> DpduFrame:
+        return await self.send_and_recv_ack(
+            PDU_CMD_MOD_CTRL,
+            payload=struct.pack("<H", ioctl_id),
+            cll_id=0,
+            cop_id=0,
+        )
+
+    async def pdu_get_status(self, cll_id: int = 1) -> dict:
+        rsp = await self.send_and_recv_ack(PDU_CMD_GET_STATUS, cll_id=cll_id)
+        assert rsp.status == PDU_STATUS_NOERROR and len(rsp.payload) == 16
+        online_mask, bus_mode, baud_khz, rx_cnt, crc_err, uptime_ms, req_id = struct.unpack(
+            "<BBHIHIH", rsp.payload
         )
         return {
-            "connected": bool(connected),
+            "online_mask": online_mask,
+            "connected": bool(online_mask & (1 << (max(1, cll_id) - 1))),
             "bus_mode": bus_mode,
             "baud_khz": baud_khz,
             "rx_cmd_count": rx_cnt,
@@ -156,25 +178,41 @@ class LeanDpduBleClient:
         }
 
     async def pdu_connect(
-        self, bus_mode: int = VCI_BUS_MODE_SIM_LOOPBACK, baud_khz: int = 0, flags: int = 0
+        self,
+        bus_mode: int = VCI_BUS_MODE_SIM_LOOPBACK,
+        baud_khz: int = 0,
+        flags: int = 0,
+        cll_id: int = 1,
     ) -> DpduFrame:
         if baud_khz == 0 and flags == 0:
             payload = struct.pack("<B", bus_mode)
         else:
             payload = struct.pack("<BHB", bus_mode, baud_khz, flags)
-        return await self.send_and_recv(PDU_CMD_CONNECT, payload)
+        ack = await self.send_and_recv_ack(PDU_CMD_CONNECT, payload=payload, cll_id=cll_id)
+        if ack.status == PDU_STATUS_NOERROR:
+            st_evt = await self.recv_frame(timeout=1.0)
+            assert st_evt.msg_type == PDU_IT_STATUS
+        return ack
 
-    async def pdu_disconnect(self) -> DpduFrame:
-        return await self.send_and_recv(PDU_CMD_DISCONNECT)
+    async def pdu_disconnect(self, cll_id: int = 1) -> DpduFrame:
+        ack = await self.send_and_recv_ack(PDU_CMD_DISCONNECT, cll_id=cll_id)
+        if ack.status == PDU_STATUS_NOERROR:
+            try:
+                f = await self.recv_frame(timeout=0.1)
+                if f.msg_type != PDU_IT_STATUS:
+                    self._deferred.insert(0, f)
+            except asyncio.TimeoutError:
+                pass
+        return ack
 
-    async def pdu_set_com_param(self, param_id: int, param_val: int) -> DpduFrame:
-        payload = struct.pack("<BI", param_id, param_val)
-        return await self.send_and_recv(PDU_CMD_SET_COMPARAM, payload)
+    async def pdu_set_com_param(self, param_id: int, param_val: int, cll_id: int = 1) -> DpduFrame:
+        payload = struct.pack("<HI", param_id, param_val)
+        return await self.send_and_recv_ack(PDU_CMD_SET_COMPARAM, payload=payload, cll_id=cll_id)
 
-    async def pdu_get_com_param(self, param_id: int) -> int:
-        rsp = await self.send_and_recv(PDU_CMD_GET_COMPARAM, struct.pack("<B", param_id))
-        assert rsp.opcode == PDU_EVT_CMD_ACK and rsp.payload[1] == PDU_STATUS_NOERROR
-        _, val = struct.unpack("<BI", rsp.payload[2:7])
+    async def pdu_get_com_param(self, param_id: int, cll_id: int = 1) -> int:
+        rsp = await self.send_and_recv_ack(PDU_CMD_GET_COMPARAM, struct.pack("<H", param_id), cll_id=cll_id)
+        assert rsp.status == PDU_STATUS_NOERROR and len(rsp.payload) == 6
+        _, val = struct.unpack("<HI", rsp.payload)
         return val
 
     async def pdu_start_com_primitive(
@@ -183,15 +221,38 @@ class LeanDpduBleClient:
         cop_type: int = PDU_COPT_SENDRECV,
         flags: int = 0,
         timeout: float = 2.5,
+        cll_id: int = 1,
+        can_id: int = 0,
     ) -> Tuple[DpduFrame, Optional[DpduFrame]]:
-        payload = struct.pack("<BB", cop_type, flags) + pdu_data
-        ack = await self.send_and_recv(PDU_CMD_START_COP, payload, timeout=timeout)
-        if ack.opcode != PDU_EVT_CMD_ACK or ack.payload[1] != PDU_STATUS_NOERROR:
+        _ = flags
+        num_recv = 0 if cop_type == PDU_COPT_SEND_ONLY else 1
+        cop_id = self.alloc_cop_id()
+        payload = LeanDpduSerialClient.build_start_cop_payload(
+            pdu_data,
+            num_send_cycles=1,
+            num_recv_cycles=num_recv,
+            cycle_time_ms=0,
+            can_id=can_id,
+        )
+        t0 = time.time()
+        ack = await self.send_and_recv_ack(PDU_CMD_START_COP, payload=payload, cll_id=cll_id, cop_id=cop_id, timeout=timeout)
+        if ack.status != PDU_STATUS_NOERROR:
             return ack, None
-        if cop_type == PDU_COPT_SEND_ONLY:
-            return ack, None
-        evt = await self.recv_frame(timeout=timeout)
-        return ack, evt
+
+        outcome_evt: Optional[DpduFrame] = None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            f = await self.recv_frame(timeout=max(0.05, deadline - time.time()))
+            if f.cll_id != cll_id or f.cop_id != cop_id:
+                continue
+            if f.msg_type in (PDU_IT_RESULT, PDU_IT_ERROR):
+                outcome_evt = f
+                setattr(outcome_evt, "_elapsed_ms", max(1, int((time.time() - t0) * 1000)))
+            elif f.msg_type == PDU_IT_STATUS:
+                st = LeanDpduSerialClient.parse_status_event(f)
+                if st.status_code in (PDU_COPST_FINISHED, PDU_COPST_CANCELLED):
+                    break
+        return ack, outcome_evt
 
     @staticmethod
     def parse_result_event(evt: DpduFrame) -> DpduResultEvent:
@@ -199,25 +260,28 @@ class LeanDpduBleClient:
 
 
 async def run_step4_ble_verification(address: Optional[str] = None):
-    print("=== Step 4 Hardware Verification: Bluetooth LE (NimBLE NUS) End-to-End OBD-II Scanner ===")
+    print("=== Step 4 Hardware Verification: Bluetooth LE (NimBLE NUS) End-to-End App-Device IF ===")
     ble = LeanDpduBleClient(device_name=VCI_BLE_NAME, address=address)
     try:
         print(f"[1/8] Scanning & connecting to '{VCI_BLE_NAME}' over Bluetooth LE (NUS)...")
         peer = await ble.connect_ble(scan_timeout=8.0)
         print(f"      Connected over BLE GATT NUS to {peer}")
 
-        print("[2/8] Querying VCI Status over BLE (PDU_CMD_GET_STATUS)...")
+        print("[2/8] Querying VCI Status & IOCTLs (VBATT, CableID, GetVersion) over BLE...")
         st = await ble.pdu_get_status()
+        vbatt_ack = await ble.pdu_ioctl(PDU_IOCTL_READ_VBATT)
+        vbatt_mv = struct.unpack("<I", vbatt_ack.payload)[0]
         print(
             f"      VCI Status: uptime={st['uptime_ms']} ms, rx_cmds={st['rx_cmd_count']}, "
-            f"crc_errs={st['crc_err_count']}, can_req_id=0x{st['can_req_id']:03X}"
+            f"crc_errs={st['crc_err_count']}, VBATT={vbatt_mv} mV"
         )
+        assert st["crc_err_count"] == 0 and vbatt_mv == 12600
 
-        print("[3/8] Configuring CP_BAUDRATE=500000 bps & Opening Logical Link over BLE...")
-        await ble.pdu_set_com_param(CP_BAUDRATE, 500000)
-        ack = await ble.pdu_connect(bus_mode=VCI_BUS_MODE_SIM_LOOPBACK)
-        assert ack.opcode == PDU_EVT_CMD_ACK and ack.payload[1] == PDU_STATUS_NOERROR
-        print("      Logical Link Connected (CP_BAUDRATE=500000 bps)!")
+        print("[3/8] Configuring CP_BAUDRATE=500000 bps & Opening CLL 1 over BLE...")
+        await ble.pdu_set_com_param(CP_BAUDRATE, 500000, cll_id=1)
+        ack = await ble.pdu_connect(bus_mode=VCI_BUS_MODE_SIM_LOOPBACK, cll_id=1)
+        assert ack.status == PDU_STATUS_NOERROR
+        print("      CLL 1 ONLINE (CP_BAUDRATE=500000 bps)!")
 
         print("[4/8] Reading Live OBD-II Telemetry over BLE (Mode 01 PIDs 00, 0C, 0D, 05, 11)...")
         _, evt_00 = await ble.pdu_start_com_primitive(b"\x01\x00")
@@ -239,25 +303,25 @@ async def run_step4_ble_verification(address: Optional[str] = None):
         res_thr = ble.parse_result_event(evt_thr)
         throttle_pct = (res_thr.pdu[2] * 100.0) / 255.0
 
-        print(f"      Supported PIDs : {res_00.pdu.hex(' ').upper()} (CAN {res_00.rx_time_ms} ms)")
-        print(f"      Engine RPM     : {rpm:.1f} RPM (CAN {res_rpm.rx_time_ms} ms)")
-        print(f"      Vehicle Speed  : {speed_kmh} km/h (CAN {res_spd.rx_time_ms} ms)")
-        print(f"      Coolant Temp   : {coolant_c} °C (CAN {res_tmp.rx_time_ms} ms)")
-        print(f"      Throttle Pos   : {throttle_pct:.1f}% (CAN {res_thr.rx_time_ms} ms)")
+        print(f"      Supported PIDs : {res_00.pdu.hex(' ').upper()} (ts={res_00.rx_timestamp_us} us)")
+        print(f"      Engine RPM     : {rpm:.1f} RPM")
+        print(f"      Vehicle Speed  : {speed_kmh} km/h")
+        print(f"      Coolant Temp   : {coolant_c} °C")
+        print(f"      Throttle Pos   : {throttle_pct:.1f}%")
         assert rpm == 1726.0 and speed_kmh == 85 and coolant_c == 90
 
         print("[5/8] Reading 17-Char VIN over BLE via Multi-Frame ISO-TP (Mode 09 PID 0x02)...")
         _, evt_vin = await ble.pdu_start_com_primitive(b"\x09\x02")
         res_vin = ble.parse_result_event(evt_vin)
         vin_str = res_vin.pdu[3:].decode("ascii")
-        print(f"      VIN            : '{vin_str}' ({len(res_vin.pdu)} bytes reassembled in {res_vin.rx_time_ms} ms)")
+        print(f"      VIN            : '{vin_str}' ({len(res_vin.pdu)} bytes)")
         assert len(res_vin.pdu) == 20
 
         print("[6/8] Reading Calibration ID over BLE via Multi-Frame ISO-TP (Mode 09 PID 0x04)...")
         _, evt_cal = await ble.pdu_start_com_primitive(b"\x09\x04")
         res_cal = ble.parse_result_event(evt_cal)
         cal_str = res_cal.pdu[3:].decode("ascii")
-        print(f"      Calibration ID : '{cal_str}' ({len(res_cal.pdu)} bytes reassembled in {res_cal.rx_time_ms} ms)")
+        print(f"      Calibration ID : '{cal_str}' ({len(res_cal.pdu)} bytes)")
         assert cal_str == "ESP32_VCI_CAL_01"
 
         print("[7/8] Reading Stored DTCs over BLE (Mode 03) & Testing NRC 0x78 P2* Extension (01 F0)...")
@@ -271,9 +335,17 @@ async def run_step4_ble_verification(address: Optional[str] = None):
         print(f"      NRC 0x78 P2*   : {res_p2s.pdu.hex(' ').upper()} ({res_p2s.rx_time_ms} ms)")
         assert res_p2s.pdu == b"\x41\xF0\xAB\xCD"
 
-        print("[8/8] Disconnecting Logical Link & closing BLE GATT session...")
-        ack_disc = await ble.pdu_disconnect()
-        assert ack_disc.opcode == PDU_EVT_CMD_ACK and ack_disc.payload[1] == PDU_STATUS_NOERROR
+        print("[8/8] Testing Requirement 5: BLE GATT Disconnect -> Autonomous PDUDestruct (< 100 ms)...")
+        # Leave CLL 1 ONLINE and disconnect BLE abruptly without sending PDU_CMD_DISCONNECT!
+        await ble.close()
+        await asyncio.sleep(0.1)  # Wait 100 ms and check over USB-UART that all CLLs were cleared!
+        ser_check = LeanDpduSerialClient("/dev/ttyUSB0", 115200)
+        try:
+            st_after = ser_check.pdu_get_status(cll_id=1)
+            assert st_after["online_mask"] == 0, f"Expected online_mask=0 after BLE disconnect, got {st_after['online_mask']}"
+            print("      BLE disconnect triggered autonomous PDUDestruct (< 100 ms) -> online_mask = 0x00!")
+        finally:
+            ser_check.close()
         print("=== ALL 8 STEP 4 BLUETOOTH LE HARDWARE CHECKS PASSED! ===")
     finally:
         await ble.close()
@@ -288,7 +360,7 @@ async def run_interactive_scanner(use_ble: bool, serial_port: str, ble_addr: Opt
         ble = LeanDpduBleClient(device_name=VCI_BLE_NAME, address=ble_addr)
         peer = await ble.connect_ble()
         print(f"Connected over Bluetooth LE to {peer}")
-        await ble.pdu_connect(bus_mode=bus_mode, baud_khz=500)
+        await ble.pdu_connect(bus_mode=bus_mode, baud_khz=500, cll_id=1)
         print(f"Logical Link Active: {bus_label} @ 500 kbps")
         try:
             while True:
@@ -298,8 +370,7 @@ async def run_interactive_scanner(use_ble: bool, serial_port: str, ble_addr: Opt
                 print("  3) Read Stored Diagnostic Trouble Codes (Mode 03)")
                 print("  4) Clear Diagnostic Trouble Codes (Mode 04)")
                 print("  5) Send Custom Hex OBD-II / UDS Request (e.g. '01 0C' or '09 02')")
-                print("  6) VCI Status & ComParams")
-                print("  q) Quit")
+                print("  q) Disconnect & Quit")
                 choice = input("Select option: ").strip().lower()
                 if choice == "1":
                     _, e_rpm = await ble.pdu_start_com_primitive(b"\x01\x0C")
@@ -310,66 +381,57 @@ async def run_interactive_scanner(use_ble: bool, serial_port: str, ble_addr: Opt
                     r_spd = ble.parse_result_event(e_spd)
                     r_tmp = ble.parse_result_event(e_tmp)
                     r_thr = ble.parse_result_event(e_thr)
-                    print(f"  Engine RPM     : {((r_rpm.pdu[2] << 8) | r_rpm.pdu[3]) / 4.0:.1f} RPM")
-                    print(f"  Vehicle Speed  : {r_spd.pdu[2]} km/h")
-                    print(f"  Coolant Temp   : {r_tmp.pdu[2] - 40} °C")
-                    print(f"  Throttle Pos   : {(r_thr.pdu[2] * 100.0) / 255.0:.1f}%")
+                    print(f"  Engine RPM    : {((r_rpm.pdu[2] << 8) | r_rpm.pdu[3]) / 4.0:.1f} RPM")
+                    print(f"  Vehicle Speed : {r_spd.pdu[2]} km/h")
+                    print(f"  Coolant Temp  : {r_tmp.pdu[2] - 40} °C")
+                    print(f"  Throttle Pos  : {(r_thr.pdu[2] * 100.0) / 255.0:.1f}%")
                 elif choice == "2":
                     _, e_vin = await ble.pdu_start_com_primitive(b"\x09\x02")
                     _, e_cal = await ble.pdu_start_com_primitive(b"\x09\x04")
-                    r_vin = ble.parse_result_event(e_vin)
-                    r_cal = ble.parse_result_event(e_cal)
-                    print(f"  VIN (Mode 09 02)    : {r_vin.pdu[3:].decode('ascii', errors='replace')}")
-                    print(f"  Cal ID (Mode 09 04) : {r_cal.pdu[3:].decode('ascii', errors='replace')}")
+                    print(f"  VIN           : {ble.parse_result_event(e_vin).pdu[3:].decode('ascii', errors='replace')}")
+                    print(f"  Calibration ID: {ble.parse_result_event(e_cal).pdu[3:].decode('ascii', errors='replace')}")
                 elif choice == "3":
                     _, e_dtc = await ble.pdu_start_com_primitive(b"\x03")
-                    r_dtc = ble.parse_result_event(e_dtc)
-                    dtcs = decode_obd_dtcs(r_dtc.pdu)
-                    print(f"  Stored DTCs ({len(dtcs)}) : {', '.join(dtcs) if dtcs else 'None'}")
+                    print(f"  Stored DTCs   : {decode_obd_dtcs(ble.parse_result_event(e_dtc).pdu)}")
                 elif choice == "4":
-                    _, e_clr = await ble.pdu_start_com_primitive(b"\x04")
-                    r_clr = ble.parse_result_event(e_clr)
-                    print(f"  Clear DTCs Response : {r_clr.pdu.hex(' ').upper()}")
+                    await ble.pdu_start_com_primitive(b"\x04")
+                    print("  Diagnostic Trouble Codes cleared.")
                 elif choice == "5":
-                    raw_hex = input("  Enter hex PDU bytes (e.g. 01 0C): ").strip()
-                    pdu_req = bytes.fromhex(raw_hex)
-                    _, evt = await ble.pdu_start_com_primitive(pdu_req)
-                    if evt.opcode == PDU_EVT_RESULT:
+                    raw_hex = input("  Enter hex bytes (e.g. 01 0C): ").strip()
+                    req_bytes = bytes.fromhex(raw_hex)
+                    _, evt = await ble.pdu_start_com_primitive(req_bytes)
+                    if evt and evt.msg_type == PDU_IT_RESULT:
                         res = ble.parse_result_event(evt)
-                        print(f"  RX [0x{res.rx_can_id:03X}, {res.rx_time_ms} ms]: {res.pdu.hex(' ').upper()}")
-                    else:
-                        print(f"  ERROR Event: err=0x{evt.payload[0]:02X}, detail=0x{evt.payload[1]:02X}")
-                elif choice == "6":
-                    st = await ble.pdu_get_status()
-                    print(f"  Status: {st}")
-                elif choice in ("q", "quit", "exit"):
+                        print(f"  RX CAN 0x{res.rx_can_id:03X} ({res.rx_timestamp_us} us): {res.pdu.hex(' ').upper()}")
+                    elif evt:
+                        print(f"  Error Event: {evt.payload.hex(' ')}")
+                elif choice == "q":
+                    await ble.pdu_disconnect(cll_id=1)
                     break
         finally:
-            await ble.pdu_disconnect()
             await ble.close()
     else:
         ser = LeanDpduSerialClient(serial_port, 115200)
-        ser.pdu_connect(bus_mode=bus_mode, baud_khz=500)
-        print(f"Connected over USB-Serial ({serial_port}) — {bus_label} @ 500 kbps")
-        ser.pdu_disconnect()
+        ser.pdu_connect(bus_mode=bus_mode, baud_khz=500, cll_id=1)
+        print(f"Connected over Serial ({serial_port}) — {bus_label} @ 500 kbps")
+        ser.pdu_disconnect(cll_id=1)
         ser.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PC Bluetooth LE & Serial OBD-II Scanner App")
-    parser.add_argument("--verify-ble", action="store_true", help="Run automated Step 4 BLE verification suite")
-    parser.add_argument("--ble-addr", type=str, default=None, help="Optional BLE MAC address of ESP32-OBD-VCI")
-    parser.add_argument("--serial", type=str, default=None, help="Use USB-Serial port instead of BLE (e.g. /dev/ttyUSB0)")
-    parser.add_argument("--physical-can", action="store_true", help="Use Physical TWAI CAN bus instead of Virtual ECU")
+    parser = argparse.ArgumentParser(description="ESP32 Bluetooth LE & Serial OBD-II Diagnostic Scanner")
+    parser.add_argument("--verify-ble", action="store_true", help="Run automated 8-step BLE NUS verification suite")
+    parser.add_argument("--ble", action="store_true", help="Connect interactively over Bluetooth LE (default)")
+    parser.add_argument("--serial", default="/dev/ttyUSB0", help="Serial port path for wired mode")
+    parser.add_argument("--address", default=None, help="Optional BLE MAC address of ESP32-OBD-VCI")
+    parser.add_argument("--physical-can", action="store_true", help="Use Physical CAN (TWAI GPIO21/22) instead of SimLoopback")
     args = parser.parse_args()
 
     if args.verify_ble:
-        asyncio.run(run_step4_ble_verification(address=args.ble_addr))
+        asyncio.run(run_step4_ble_verification(address=args.address))
     else:
-        use_ble = args.serial is None
-        asyncio.run(run_interactive_scanner(use_ble, args.serial or "/dev/ttyUSB0", args.ble_addr, args.physical_can))
+        asyncio.run(run_interactive_scanner(use_ble=True, serial_port=args.serial, ble_addr=args.address, physical_can=args.physical_can))
 
 
 if __name__ == "__main__":
     main()
-

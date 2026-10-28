@@ -23,9 +23,19 @@
 typedef void (*ble_nus_rx_cb_t)(const uint8_t *data, size_t len);
 
 /**
+ * @brief Callback invoked on Core 0 when an active BLE GATT connection drops (Link Supervision Timeout / disconnect).
+ */
+typedef void (*ble_nus_disconnect_cb_t)(void);
+
+/**
  * @brief Initialize NVS, NimBLE Host & Controller, GATT Nordic UART Service, and start advertising.
  */
 esp_err_t ble_nus_init(ble_nus_rx_cb_t rx_cb);
+
+/**
+ * @brief Register a disconnect callback to trigger autonomous PDUDestruct within 100 ms.
+ */
+void ble_nus_set_disconnect_cb(ble_nus_disconnect_cb_t disconnect_cb);
 
 /**
  * @brief Check whether a BLE Central (PC/Mobile App) is currently connected.

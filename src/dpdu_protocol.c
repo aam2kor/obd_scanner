@@ -1,57 +1,32 @@
 /**
  * @file dpdu_protocol.c
- * @brief Lean D-PDU API (ISO 22900-2 subset) binary wire framing, CRC-16-CCITT,
- *        13-ComParam Table, and ComPrimitive / ISO-TP / P2 / P2* / P3 engine.
+ * @brief ISO 22900-2:2022 App-Device IF Binary Wire Protocol, 8-CLL State, 4-Slot Queues,
+ *        Round-Robin Arbitration, IOCTLs, and 100 us Hardware Timestamps.
  */
 
 #include "dpdu_protocol.h"
 #include "can_hal.h"
 #include "isotp.h"
 #include "led_status.h"
+#include "esp_timer.h"
+#include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_timer.h"
-#include "esp_rom_sys.h"
 #include <string.h>
 
-static dpdu_check_cancel_fn_t s_cancel_check_fn = NULL;
+/* Spinlock protecting CLL queue admission/cancellation between Core 0 and Core 1 */
+static portMUX_TYPE s_vci_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
-void dpdu_engine_set_cancel_checker(dpdu_check_cancel_fn_t cancel_fn)
+uint32_t dpdu_timestamp_us(void)
 {
-    s_cancel_check_fn = cancel_fn;
+    return (uint32_t)((uint64_t)esp_timer_get_time() & 0xFFFFFFFFULL);
 }
 
-static uint16_t read_u16_le(const uint8_t *p)
+uint16_t dpdu_crc16_ccitt(const uint8_t *data, size_t len)
 {
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-}
-
-static uint32_t read_u32_le(const uint8_t *p)
-{
-    return (uint32_t)p[0] |
-           ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) |
-           ((uint32_t)p[3] << 24);
-}
-
-static void write_u16_le(uint8_t *p, uint16_t v)
-{
-    p[0] = (uint8_t)(v & 0xFFU);
-    p[1] = (uint8_t)((v >> 8) & 0xFFU);
-}
-
-static void write_u32_le(uint8_t *p, uint32_t v)
-{
-    p[0] = (uint8_t)(v & 0xFFU);
-    p[1] = (uint8_t)((v >> 8) & 0xFFU);
-    p[2] = (uint8_t)((v >> 16) & 0xFFU);
-    p[3] = (uint8_t)((v >> 24) & 0xFFU);
-}
-
-static uint16_t crc16_update(uint16_t crc, const uint8_t *data, size_t len)
-{
+    uint16_t crc = 0xFFFFU;
     for (size_t i = 0; i < len; i++) {
-        crc ^= ((uint16_t)data[i] << 8);
+        crc ^= (uint16_t)data[i] << 8;
         for (int b = 0; b < 8; b++) {
             if (crc & 0x8000U) {
                 crc = (uint16_t)((crc << 1) ^ 0x1021U);
@@ -63,351 +38,925 @@ static uint16_t crc16_update(uint16_t crc, const uint8_t *data, size_t len)
     return crc;
 }
 
-uint16_t dpdu_crc16_ccitt(const uint8_t *data, size_t len)
+static uint16_t dpdu_crc16_update(uint16_t crc, const uint8_t *data, size_t len)
 {
-    return crc16_update(0xFFFFU, data, len);
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int b = 0; b < 8; b++) {
+            if (crc & 0x8000U) {
+                crc = (uint16_t)((crc << 1) ^ 0x1021U);
+            } else {
+                crc = (uint16_t)(crc << 1);
+            }
+        }
+    }
+    return crc;
+}
+
+static void write_u16_le(uint8_t *dst, uint16_t val)
+{
+    dst[0] = (uint8_t)(val & 0xFFU);
+    dst[1] = (uint8_t)((val >> 8) & 0xFFU);
+}
+
+static uint16_t read_u16_le(const uint8_t *src)
+{
+    return (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+}
+
+static void write_u32_le(uint8_t *dst, uint32_t val)
+{
+    dst[0] = (uint8_t)(val & 0xFFU);
+    dst[1] = (uint8_t)((val >> 8) & 0xFFU);
+    dst[2] = (uint8_t)((val >> 16) & 0xFFU);
+    dst[3] = (uint8_t)((val >> 24) & 0xFFU);
+}
+
+static uint32_t read_u32_le(const uint8_t *src)
+{
+    return (uint32_t)src[0]
+         | ((uint32_t)src[1] << 8)
+         | ((uint32_t)src[2] << 16)
+         | ((uint32_t)src[3] << 24);
 }
 
 void dpdu_parser_init(dpdu_rx_parser_t *parser)
 {
+    if (parser == NULL) {
+        return;
+    }
     memset(parser, 0, sizeof(*parser));
-    parser->state = DPDU_PARSE_STATE_SOF;
+    parser->state = DPDU_PARSE_STATE_SOF0;
 }
 
 dpdu_parse_result_t dpdu_parser_feed_byte(dpdu_rx_parser_t *parser, uint8_t byte)
 {
+    if (parser == NULL) {
+        return DPDU_PARSE_ERR_HDR;
+    }
+
     switch (parser->state) {
-        case DPDU_PARSE_STATE_SOF:
-            if (byte == DPDU_SOF_BYTE) {
+        case DPDU_PARSE_STATE_SOF0:
+            if (byte == DPDU_SOF_BYTE_0) {
                 parser->hdr_buf[0] = byte;
-                parser->hdr_idx = 1;
-                parser->state = DPDU_PARSE_STATE_HDR;
+                parser->state      = DPDU_PARSE_STATE_SOF1;
+            }
+            return DPDU_PARSE_INCOMPLETE;
+
+        case DPDU_PARSE_STATE_SOF1:
+            if (byte == DPDU_SOF_BYTE_1) {
+                parser->hdr_buf[1] = byte;
+                parser->hdr_idx    = 2U;
+                parser->state      = DPDU_PARSE_STATE_HDR;
+            } else if (byte == DPDU_SOF_BYTE_0) {
+                /* Stay in SOF1 if repeated 0x55 */
+                parser->hdr_buf[0] = byte;
+            } else {
+                parser->state = DPDU_PARSE_STATE_SOF0;
             }
             return DPDU_PARSE_INCOMPLETE;
 
         case DPDU_PARSE_STATE_HDR:
             parser->hdr_buf[parser->hdr_idx++] = byte;
-            if (parser->hdr_idx == DPDU_HEADER_SIZE) {
-                uint8_t ver = parser->hdr_buf[1];
-                uint16_t len = read_u16_le(&parser->hdr_buf[6]);
-                if (ver != DPDU_PROTOCOL_VERSION || len > DPDU_MAX_PAYLOAD) {
-                    parser->state = DPDU_PARSE_STATE_SOF;
-                    return DPDU_PARSE_ERR_HDR;
-                }
-                parser->frame.opcode  = parser->hdr_buf[2];
-                parser->frame.handle  = parser->hdr_buf[3];
-                parser->frame.seq_tag = read_u16_le(&parser->hdr_buf[4]);
-                parser->frame.length  = len;
-                parser->payload_idx   = 0;
-                parser->crc_idx       = 0;
-                parser->state = (len > 0) ? DPDU_PARSE_STATE_PAYLOAD : DPDU_PARSE_STATE_CRC;
+            if (parser->hdr_idx < DPDU_HEADER_SIZE) {
+                return DPDU_PARSE_INCOMPLETE;
             }
+
+            parser->frame.msg_type = parser->hdr_buf[2];
+            parser->frame.cll_id   = parser->hdr_buf[3];
+            parser->frame.cop_id   = parser->hdr_buf[4];
+            parser->frame.status   = parser->hdr_buf[5];
+            parser->frame.length   = read_u16_le(&parser->hdr_buf[6]);
+
+            if (parser->frame.length > DPDU_MAX_PAYLOAD) {
+                parser->state = DPDU_PARSE_STATE_SOF0;
+                return DPDU_PARSE_ERR_HDR;
+            }
+
+            parser->frame.ext_payload = (parser->frame.length > DPDU_CMD_INLINE_MAX)
+                                      ? isotp_mf_pool_get_large_tx_buf()
+                                      : parser->frame.payload;
+
+            parser->payload_idx = 0U;
+            parser->crc_idx     = 0U;
+            parser->state       = (parser->frame.length == 0U)
+                                ? DPDU_PARSE_STATE_CRC
+                                : DPDU_PARSE_STATE_PAYLOAD;
             return DPDU_PARSE_INCOMPLETE;
 
-        case DPDU_PARSE_STATE_PAYLOAD:
-            parser->frame.payload[parser->payload_idx++] = byte;
+        case DPDU_PARSE_STATE_PAYLOAD: {
+            uint8_t *dst = (parser->frame.ext_payload != NULL)
+                         ? parser->frame.ext_payload
+                         : parser->frame.payload;
+            dst[parser->payload_idx++] = byte;
             if (parser->payload_idx >= parser->frame.length) {
-                parser->crc_idx = 0;
-                parser->state = DPDU_PARSE_STATE_CRC;
+                parser->crc_idx = 0U;
+                parser->state   = DPDU_PARSE_STATE_CRC;
             }
             return DPDU_PARSE_INCOMPLETE;
+        }
 
-        case DPDU_PARSE_STATE_CRC:
+        case DPDU_PARSE_STATE_CRC: {
             parser->crc_buf[parser->crc_idx++] = byte;
-            if (parser->crc_idx >= DPDU_CRC_SIZE) {
-                uint16_t rx_crc = read_u16_le(parser->crc_buf);
-                uint16_t calc_crc = crc16_update(0xFFFFU, parser->hdr_buf, DPDU_HEADER_SIZE);
-                if (parser->frame.length > 0) {
-                    calc_crc = crc16_update(calc_crc, parser->frame.payload, parser->frame.length);
-                }
-                parser->state = DPDU_PARSE_STATE_SOF;
-                if (rx_crc == calc_crc) {
-                    return DPDU_PARSE_OK;
-                }
+            if (parser->crc_idx < DPDU_CRC_SIZE) {
+                return DPDU_PARSE_INCOMPLETE;
+            }
+
+            uint16_t rx_crc = read_u16_le(parser->crc_buf);
+            /* Requirement 6: CRC16-CCITT computed over Msg_Type (offset 2) through end of Payload */
+            uint16_t calc_crc = dpdu_crc16_update(0xFFFFU, &parser->hdr_buf[2], DPDU_HEADER_SIZE - 2U);
+            if (parser->frame.length > 0U) {
+                const uint8_t *pld = (parser->frame.ext_payload != NULL)
+                                   ? parser->frame.ext_payload
+                                   : parser->frame.payload;
+                calc_crc = dpdu_crc16_update(calc_crc, pld, parser->frame.length);
+            }
+
+            parser->state = DPDU_PARSE_STATE_SOF0;
+            if (rx_crc != calc_crc) {
                 return DPDU_PARSE_ERR_CRC;
             }
-            return DPDU_PARSE_INCOMPLETE;
+            return DPDU_PARSE_OK;
+        }
 
         default:
-            parser->state = DPDU_PARSE_STATE_SOF;
-            return DPDU_PARSE_INCOMPLETE;
+            parser->state = DPDU_PARSE_STATE_SOF0;
+            return DPDU_PARSE_ERR_HDR;
     }
 }
 
-size_t dpdu_encode_frame(const dpdu_frame_t *frame, uint8_t *out_buf, size_t out_max)
+size_t dpdu_encode_packet(
+    uint8_t msg_type,
+    uint8_t cll_id,
+    uint8_t cop_id,
+    uint8_t status,
+    const uint8_t *payload,
+    uint16_t payload_len,
+    uint8_t *out_buf,
+    size_t out_max
+)
 {
-    size_t total_len = DPDU_HEADER_SIZE + frame->length + DPDU_CRC_SIZE;
-    if (frame->length > DPDU_MAX_PAYLOAD || out_max < total_len) {
-        return 0;
+    if (out_buf == NULL || payload_len > DPDU_MAX_PAYLOAD) {
+        return 0U;
+    }
+    size_t total_len = DPDU_HEADER_SIZE + (size_t)payload_len + DPDU_CRC_SIZE;
+    if (out_max < total_len) {
+        return 0U;
     }
 
-    out_buf[0] = DPDU_SOF_BYTE;
-    out_buf[1] = DPDU_PROTOCOL_VERSION;
-    out_buf[2] = frame->opcode;
-    out_buf[3] = frame->handle;
-    write_u16_le(&out_buf[4], frame->seq_tag);
-    write_u16_le(&out_buf[6], frame->length);
+    out_buf[0] = DPDU_SOF_BYTE_0;
+    out_buf[1] = DPDU_SOF_BYTE_1;
+    out_buf[2] = msg_type;
+    out_buf[3] = cll_id;
+    out_buf[4] = cop_id;
+    out_buf[5] = status;
+    write_u16_le(&out_buf[6], payload_len);
 
-    if (frame->length > 0) {
-        memcpy(&out_buf[DPDU_HEADER_SIZE], frame->payload, frame->length);
+    if (payload_len > 0U && payload != NULL) {
+        memcpy(&out_buf[DPDU_HEADER_SIZE], payload, payload_len);
     }
 
-    uint16_t crc = dpdu_crc16_ccitt(out_buf, DPDU_HEADER_SIZE + frame->length);
-    write_u16_le(&out_buf[DPDU_HEADER_SIZE + frame->length], crc);
-
+    /* CRC16-CCITT over Msg_Type (byte 2) through end of Payload */
+    uint16_t crc = dpdu_crc16_ccitt(&out_buf[2], (DPDU_HEADER_SIZE - 2U) + (size_t)payload_len);
+    write_u16_le(&out_buf[DPDU_HEADER_SIZE + payload_len], crc);
     return total_len;
+}
+
+static void emit_ack(
+    dpdu_send_pkt_fn_t send_fn,
+    uint8_t cll_id,
+    uint8_t cop_id,
+    uint8_t status,
+    const uint8_t *payload,
+    uint16_t payload_len
+)
+{
+    if (send_fn != NULL) {
+        send_fn(PDU_EVT_CMD_ACK, cll_id, cop_id, status, payload, payload_len);
+    }
+}
+
+static void emit_it_status(
+    dpdu_send_pkt_fn_t send_fn,
+    uint8_t cll_id,
+    uint8_t cop_id,
+    uint16_t status_code
+)
+{
+    if (send_fn == NULL) {
+        return;
+    }
+    uint8_t payload[6];
+    write_u32_le(&payload[0], dpdu_timestamp_us());
+    write_u16_le(&payload[4], status_code);
+    send_fn(PDU_IT_STATUS, cll_id, cop_id, 0U, payload, sizeof(payload));
+}
+
+static void emit_it_error(
+    dpdu_send_pkt_fn_t send_fn,
+    uint8_t cll_id,
+    uint8_t cop_id,
+    uint16_t err_code,
+    uint16_t vendor_subcode
+)
+{
+    if (send_fn == NULL) {
+        return;
+    }
+    uint8_t payload[8];
+    write_u32_le(&payload[0], dpdu_timestamp_us());
+    write_u16_le(&payload[4], err_code);
+    write_u16_le(&payload[6], vendor_subcode);
+    send_fn(PDU_IT_ERROR, cll_id, cop_id, 0U, payload, sizeof(payload));
+}
+
+static void emit_it_result(
+    dpdu_send_pkt_fn_t send_fn,
+    uint8_t cll_id,
+    uint8_t cop_id,
+    uint32_t rx_timestamp_us,
+    uint32_t rx_can_id,
+    uint8_t extra_addr_info,
+    const uint8_t *npdu,
+    uint16_t npdu_len
+)
+{
+    if (send_fn == NULL || npdu == NULL || npdu_len == 0U || npdu_len > VCI_ISOTP_MAX_PDU_LEN) {
+        return;
+    }
+
+    if (npdu_len <= 256U) {
+        static uint8_t s_small_res[9U + 256U];
+        write_u32_le(&s_small_res[0], rx_timestamp_us);
+        write_u32_le(&s_small_res[4], rx_can_id);
+        s_small_res[8] = extra_addr_info;
+        memcpy(&s_small_res[9], npdu, npdu_len);
+        send_fn(PDU_IT_RESULT, cll_id, cop_id, 0U, s_small_res, (uint16_t)(9U + npdu_len));
+    } else {
+        /* Multi-Frame PDUs > 256B reside in isotp_mf_buf_t::data, preceded by result_hdr_pad[9] */
+        uint8_t *in_place = ((uint8_t *)(uintptr_t)npdu) - 9U;
+        write_u32_le(&in_place[0], rx_timestamp_us);
+        write_u32_le(&in_place[4], rx_can_id);
+        in_place[8] = extra_addr_info;
+        send_fn(PDU_IT_RESULT, cll_id, cop_id, 0U, in_place, (uint16_t)(9U + npdu_len));
+    }
+}
+
+static void reset_cll_defaults(dpdu_cll_t *cll, uint8_t cll_id)
+{
+    memset(cll, 0, sizeof(*cll));
+    cll->cll_id             = cll_id;
+    cll->online             = false;
+    cll->baudrate_bps       = 500000UL;     /* CP_BAUDRATE */
+    cll->can_req_id         = 0x7DFUL;      /* CP_CAN_PHYS_REQ_ID */
+    cll->can_resp_id        = 0x7E8UL;      /* CP_CAN_RESP_USDT_ID */
+    cll->addressing_type    = DPDU_ADDR_FUNCTIONAL;
+    cll->can_filler_byte    = 0xCCUL;       /* CP_CAN_FILLER_BYTE */
+    cll->isotp_bs           = 0UL;          /* CP_BLOCK_SIZE */
+    cll->isotp_stmin        = 0UL;          /* CP_ST_MIN */
+    cll->isotp_n_bs_ms      = 1000UL;       /* CP_N_BS_MS */
+    cll->isotp_n_cr_ms      = 1000UL;       /* CP_N_CR_MS */
+    cll->p2_max_ms          = 50UL;         /* CP_P2_MAX_MS */
+    cll->p2_star_ms         = 5000UL;       /* CP_P2_STAR_MS */
+    cll->p3_phys_ms         = 5UL;          /* CP_P3_PHYS_MS */
+    cll->p3_func_ms         = 50UL;         /* CP_P3_FUNC_MS */
+    cll->next_allowed_tx_us = 0LL;
 }
 
 void dpdu_engine_init(dpdu_vci_state_t *state)
 {
-    memset(state, 0, sizeof(*state));
-    state->connected          = false;
-    state->bus_mode           = VCI_BUS_MODE_SIM_LOOPBACK;
-
-    /* Initialize all 13 ISO 22900-2 aligned ComParams */
-    state->baudrate_bps       = 500000U;                /* CP_BAUDRATE */
-    state->can_req_id         = 0x000007DFU;            /* CP_CAN_PHYS_REQ_ID */
-    state->can_resp_id        = 0x000007E8U;            /* CP_CAN_RESP_USDT_ID */
-    state->addressing_type    = DPDU_ADDR_FUNCTIONAL;   /* CP_ADDRESSING_TYPE */
-    state->can_filler_byte    = 0xCCU;                  /* CP_CAN_FILLER_BYTE */
-    state->isotp_bs           = 0U;                     /* CP_BLOCK_SIZE */
-    state->isotp_stmin        = 0U;                     /* CP_ST_MIN */
-    state->isotp_n_bs_ms      = 1000U;                  /* CP_N_BS_MS */
-    state->isotp_n_cr_ms      = 1000U;                  /* CP_N_CR_MS */
-    state->p2_max_ms          = 50U;                    /* CP_P2_MAX_MS */
-    state->p2_star_ms         = 5000U;                  /* CP_P2_STAR_MS */
-    state->p3_phys_ms         = 5U;                     /* CP_P3_PHYS_MS */
-    state->p3_func_ms         = 50U;                    /* CP_P3_FUNC_MS */
-    state->next_allowed_tx_us = 0LL;
-}
-
-void dpdu_build_ack_frame(dpdu_frame_t *out_ack, const dpdu_frame_t *cmd, uint8_t status)
-{
-    memset(out_ack, 0, sizeof(*out_ack));
-    out_ack->opcode     = PDU_EVT_CMD_ACK;
-    out_ack->handle     = cmd->handle;
-    out_ack->seq_tag    = cmd->seq_tag;
-    out_ack->length     = 2U;
-    out_ack->payload[0] = cmd->opcode;
-    out_ack->payload[1] = status;
-}
-
-void dpdu_build_error_frame(dpdu_frame_t *out_err, const dpdu_frame_t *cmd, uint8_t err_code, uint8_t detail)
-{
-    memset(out_err, 0, sizeof(*out_err));
-    out_err->opcode     = PDU_EVT_ERROR;
-    out_err->handle     = cmd->handle;
-    out_err->seq_tag    = cmd->seq_tag;
-    out_err->length     = 2U;
-    out_err->payload[0] = err_code;
-    out_err->payload[1] = detail;
-}
-
-uint8_t dpdu_validate_start_cop(const dpdu_vci_state_t *state, const dpdu_frame_t *cmd)
-{
-    if (!state->connected) {
-        return PDU_STATUS_NOT_CONN;
-    }
-    if (cmd->length < 3U) {
-        return PDU_STATUS_INVALID_ARG;
-    }
-    uint8_t cop_type = cmd->payload[0];
-    if (cop_type != PDU_COPT_SENDRECV && cop_type != PDU_COPT_SEND_ONLY) {
-        return PDU_STATUS_INVALID_ARG;
-    }
-    return PDU_STATUS_NOERROR;
-}
-
-static void emit_ack(
-    dpdu_emit_evt_fn_t emit_fn,
-    const dpdu_frame_t *cmd,
-    uint8_t status,
-    const uint8_t *extra,
-    uint16_t extra_len
-)
-{
-    static dpdu_frame_t rsp;
-    dpdu_build_ack_frame(&rsp, cmd, status);
-    if (extra != NULL && extra_len > 0 && (2U + extra_len) <= DPDU_MAX_PAYLOAD) {
-        memcpy(&rsp.payload[2], extra, extra_len);
-        rsp.length = 2U + extra_len;
-    }
-    emit_fn(&rsp);
-}
-
-static void emit_result(
-    dpdu_emit_evt_fn_t emit_fn,
-    const dpdu_frame_t *cmd,
-    uint32_t rx_can_id,
-    uint16_t rx_time_ms,
-    const uint8_t *pdu,
-    uint16_t pdu_len
-)
-{
-    static dpdu_frame_t rsp;
-    if ((6U + pdu_len) > DPDU_MAX_PAYLOAD) {
+    if (state == NULL) {
         return;
     }
-    memset(&rsp, 0, sizeof(rsp));
-    rsp.opcode  = PDU_EVT_RESULT;
-    rsp.handle  = cmd->handle;
-    rsp.seq_tag = cmd->seq_tag;
-    write_u32_le(&rsp.payload[0], rx_can_id);
-    write_u16_le(&rsp.payload[4], rx_time_ms);
-    memcpy(&rsp.payload[6], pdu, pdu_len);
-    rsp.length = 6U + pdu_len;
-    emit_fn(&rsp);
+    memset(state, 0, sizeof(*state));
+    for (uint8_t i = 0U; i < VCI_MAX_CLLS; i++) {
+        reset_cll_defaults(&state->clls[i], (uint8_t)(i + 1U));
+    }
+    isotp_mf_pool_reset_all();
+    led_status_set_mode(VCI_LED_DISCONNECTED);
 }
 
-static void emit_error(
-    dpdu_emit_evt_fn_t emit_fn,
+void dpdu_engine_destruct_all(dpdu_vci_state_t *state, dpdu_send_pkt_fn_t send_fn, bool emit_events)
+{
+    if (state == NULL) {
+        return;
+    }
+
+    uint8_t offline_clls[VCI_MAX_CLLS];
+    uint8_t offline_cnt = 0U;
+
+    portENTER_CRITICAL(&s_vci_spinlock);
+    for (uint8_t i = 0U; i < VCI_MAX_CLLS; i++) {
+        dpdu_cll_t *cll = &state->clls[i];
+        if (cll->online) {
+            offline_clls[offline_cnt++] = cll->cll_id;
+        }
+        cll->online    = false;
+        cll->cop_head  = 0U;
+        cll->cop_tail  = 0U;
+        cll->cop_count = 0U;
+        memset(cll->cop_queue, 0, sizeof(cll->cop_queue));
+    }
+    state->online_cll_count    = 0U;
+    state->locked_baudrate_bps = 0UL;
+    state->large_tx_in_use     = false;
+    portEXIT_CRITICAL(&s_vci_spinlock);
+
+    isotp_mf_pool_reset_all();
+    can_hal_stop();
+    led_status_set_mode(VCI_LED_DISCONNECTED);
+
+    if (emit_events && send_fn != NULL) {
+        for (uint8_t i = 0U; i < offline_cnt; i++) {
+            emit_it_status(send_fn, offline_clls[i], 0U, PDU_CLLST_OFFLINE);
+        }
+    }
+}
+
+static dpdu_cll_t *get_cll(dpdu_vci_state_t *state, uint8_t cll_id)
+{
+    if (state == NULL || cll_id < 1U || cll_id > VCI_MAX_CLLS) {
+        return NULL;
+    }
+    return &state->clls[cll_id - 1U];
+}
+
+static bool is_supported_baudrate(uint32_t bps)
+{
+    return (bps == 125000UL || bps == 250000UL || bps == 500000UL || bps == 1000000UL);
+}
+
+static bool is_valid_stmin(uint32_t val)
+{
+    return (val <= 0x7FUL) || (val >= 0xF1UL && val <= 0xF9UL);
+}
+
+static void handle_mod_ctrl_ioctl(
+    dpdu_vci_state_t *state,
     const dpdu_frame_t *cmd,
-    uint8_t err_code,
-    uint8_t detail
+    dpdu_send_pkt_fn_t send_fn
 )
 {
-    static dpdu_frame_t rsp;
-    memset(&rsp, 0, sizeof(rsp));
-    rsp.opcode     = PDU_EVT_ERROR;
-    rsp.handle     = cmd->handle;
-    rsp.seq_tag    = cmd->seq_tag;
-    rsp.length     = 2U;
-    rsp.payload[0] = err_code;
-    rsp.payload[1] = detail;
-    emit_fn(&rsp);
-}
-
-static bool is_valid_baudrate_bps(uint32_t *inout_baud)
-{
-    /* Accept either bps (125000, 250000, 500000, 1000000) or kHz (125, 250, 500, 1000) */
-    if (*inout_baud == 125U || *inout_baud == 250U || *inout_baud == 500U || *inout_baud == 1000U) {
-        *inout_baud *= 1000U;
+    (void)state;
+    if (cmd->cll_id != 0U || cmd->length < 2U) {
+        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+        return;
     }
-    return (*inout_baud == 125000U ||
-            *inout_baud == 250000U ||
-            *inout_baud == 500000U ||
-            *inout_baud == 1000000U);
+
+    uint16_t ioctl_id = read_u16_le(&cmd->payload[0]);
+    switch (ioctl_id) {
+        case PDU_IOCTL_READ_VBATT: {
+            uint8_t rsp[4];
+            write_u32_le(rsp, VCI_DEFAULT_VBATT_MV);
+            emit_ack(send_fn, 0U, cmd->cop_id, PDU_STATUS_NOERROR, rsp, sizeof(rsp));
+            break;
+        }
+        case PDU_IOCTL_GET_CABLE_ID: {
+            uint8_t rsp[4];
+            write_u32_le(rsp, VCI_SAE_J1962_CABLE_ID);
+            emit_ack(send_fn, 0U, cmd->cop_id, PDU_STATUS_NOERROR, rsp, sizeof(rsp));
+            break;
+        }
+        case PDU_IOCTL_GET_VERSION: {
+            uint8_t rsp[16];
+            uint8_t mac[6] = {0};
+            (void)esp_efuse_mac_get_default(mac);
+            write_u32_le(&rsp[0], VCI_FW_VERSION_U32);
+            write_u32_le(&rsp[4], VCI_HW_VERSION_U32);
+            memset(&rsp[8], 0, 8U);
+            memcpy(&rsp[8], mac, 6U);
+            emit_ack(send_fn, 0U, cmd->cop_id, PDU_STATUS_NOERROR, rsp, sizeof(rsp));
+            break;
+        }
+        default:
+            emit_ack(send_fn, 0U, cmd->cop_id, PDU_ERR_FCT_NOT_SUPPORTED, NULL, 0U);
+            break;
+    }
 }
 
-static void enforce_p3_inter_request_delay(dpdu_vci_state_t *state)
+void dpdu_engine_handle_host_cmd(
+    dpdu_vci_state_t *state,
+    const dpdu_frame_t *cmd,
+    dpdu_send_pkt_fn_t send_fn
+)
 {
-    while (esp_timer_get_time() < state->next_allowed_tx_us) {
-        if (s_cancel_check_fn != NULL && s_cancel_check_fn(NULL)) {
+    if (state == NULL || cmd == NULL) {
+        return;
+    }
+
+    state->rx_cmd_count++;
+
+    switch (cmd->msg_type) {
+        case PDU_CMD_MOD_CTRL:
+            handle_mod_ctrl_ioctl(state, cmd, send_fn);
+            return;
+
+        case PDU_CMD_CONNECT: {
+            dpdu_cll_t *cll = get_cll(state, cmd->cll_id);
+            if (cll == NULL) {
+                emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                return;
+            }
+
+            uint8_t req_bus_mode = (cmd->length >= 1U) ? cmd->payload[0] : VCI_BUS_MODE_SIM_LOOPBACK;
+            if (cmd->length >= 3U) {
+                /* Optional legacy [bus_mode:1B][baud_khz:2B] */
+                uint32_t legacy_bps = (uint32_t)read_u16_le(&cmd->payload[1]) * 1000UL;
+                if (is_supported_baudrate(legacy_bps)) {
+                    cll->baudrate_bps = legacy_bps;
+                }
+            }
+
+            /* Requirement 3: First CLL to enter ONLINE locks CP_Baudrate; reject conflicting rates */
+            if (state->online_cll_count > 0U && cll->baudrate_bps != state->locked_baudrate_bps) {
+                emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_ERR_BAUDRATE_CONFLICT, NULL, 0U);
+                return;
+            }
+
+            if (state->online_cll_count == 0U) {
+                uint16_t baud_khz = (uint16_t)(cll->baudrate_bps / 1000UL);
+                if (can_hal_start(req_bus_mode, baud_khz) != ESP_OK) {
+                    emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                    return;
+                }
+                state->locked_baudrate_bps = cll->baudrate_bps;
+                state->bus_mode            = req_bus_mode;
+            }
+
+            portENTER_CRITICAL(&s_vci_spinlock);
+            if (!cll->online) {
+                cll->online = true;
+                state->online_cll_count++;
+            }
+            cll->next_allowed_tx_us = 0LL;
+            portEXIT_CRITICAL(&s_vci_spinlock);
+
+            led_status_set_mode(VCI_LED_CONNECTED_IDLE);
+            emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_NOERROR, NULL, 0U);
+            emit_it_status(send_fn, cmd->cll_id, 0U, PDU_CLLST_ONLINE);
             return;
         }
-        int64_t wait_us = state->next_allowed_tx_us - esp_timer_get_time();
-        if (wait_us <= 0) {
-            break;
+
+        case PDU_CMD_DISCONNECT: {
+            if (cmd->cll_id == 0U) {
+                /* Module-level disconnect -> full PDUDestruct equivalent */
+                emit_ack(send_fn, 0U, cmd->cop_id, PDU_STATUS_NOERROR, NULL, 0U);
+                dpdu_engine_destruct_all(state, send_fn, true);
+                return;
+            }
+
+            dpdu_cll_t *cll = get_cll(state, cmd->cll_id);
+            if (cll == NULL) {
+                emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                return;
+            }
+
+            bool stop_can = false;
+            portENTER_CRITICAL(&s_vci_spinlock);
+            if (cll->online) {
+                cll->online = false;
+                if (state->online_cll_count > 0U) {
+                    state->online_cll_count--;
+                }
+            }
+            for (uint8_t i = 0U; i < VCI_CLL_COP_QUEUE_DEPTH; i++) {
+                if (cll->cop_queue[i].in_use && cll->cop_queue[i].uses_large_tx_buf) {
+                    state->large_tx_in_use = false;
+                }
+            }
+            cll->cop_head  = 0U;
+            cll->cop_tail  = 0U;
+            cll->cop_count = 0U;
+            memset(cll->cop_queue, 0, sizeof(cll->cop_queue));
+            if (state->online_cll_count == 0U) {
+                state->locked_baudrate_bps = 0UL;
+                stop_can = true;
+            }
+            portEXIT_CRITICAL(&s_vci_spinlock);
+
+            isotp_mf_pool_release_cll(cmd->cll_id);
+            if (stop_can) {
+                can_hal_stop();
+                led_status_set_mode(VCI_LED_DISCONNECTED);
+            }
+            emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_NOERROR, NULL, 0U);
+            emit_it_status(send_fn, cmd->cll_id, 0U, PDU_CLLST_OFFLINE);
+            return;
         }
-        if (wait_us >= 10000LL) {
-            vTaskDelay(1);
-        } else {
-            esp_rom_delay_us((uint32_t)wait_us);
-            break;
+
+        case PDU_CMD_SET_COMPARAM: {
+            dpdu_cll_t *cll = get_cll(state, cmd->cll_id);
+            if (cll == NULL || cmd->length < 5U) {
+                emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                return;
+            }
+
+            uint16_t param_id;
+            uint32_t param_val;
+            if (cmd->length >= 6U) {
+                /* Requirement 7: [Param_ID (2B LE) | Param_Value (4B LE)] */
+                param_id  = read_u16_le(&cmd->payload[0]);
+                param_val = read_u32_le(&cmd->payload[2]);
+            } else {
+                /* Legacy 5B: [Param_ID (1B) | Param_Value (4B LE)] */
+                param_id  = cmd->payload[0];
+                param_val = read_u32_le(&cmd->payload[1]);
+            }
+
+            switch (param_id) {
+                case CP_BAUDRATE:
+                    if (!is_supported_baudrate(param_val)) {
+                        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                        return;
+                    }
+                    if (state->online_cll_count > 1U && param_val != state->locked_baudrate_bps) {
+                        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_ERR_BAUDRATE_CONFLICT, NULL, 0U);
+                        return;
+                    }
+                    cll->baudrate_bps = param_val;
+                    if (cll->online && state->online_cll_count == 1U) {
+                        state->locked_baudrate_bps = param_val;
+                    }
+                    break;
+                case CP_CAN_PHYS_REQ_ID:
+                    cll->can_req_id = param_val;
+                    break;
+                case CP_CAN_RESP_USDT_ID:
+                    cll->can_resp_id = param_val;
+                    break;
+                case CP_ADDRESSING_TYPE:
+                    if (param_val > DPDU_ADDR_PHYSICAL) {
+                        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                        return;
+                    }
+                    cll->addressing_type = param_val;
+                    break;
+                case CP_CAN_FILLER_BYTE:
+                    if (param_val > 0xFFUL) {
+                        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                        return;
+                    }
+                    cll->can_filler_byte = param_val;
+                    break;
+                case CP_BLOCK_SIZE:
+                    if (param_val > 0xFFUL) {
+                        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                        return;
+                    }
+                    cll->isotp_bs = param_val;
+                    break;
+                case CP_ST_MIN:
+                    if (!is_valid_stmin(param_val)) {
+                        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                        return;
+                    }
+                    cll->isotp_stmin = param_val;
+                    break;
+                case CP_N_BS_MS:
+                    if (param_val == 0UL || param_val > 60000UL) {
+                        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                        return;
+                    }
+                    cll->isotp_n_bs_ms = param_val;
+                    break;
+                case CP_N_CR_MS:
+                    if (param_val == 0UL || param_val > 60000UL) {
+                        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                        return;
+                    }
+                    cll->isotp_n_cr_ms = param_val;
+                    break;
+                case CP_P2_MAX_MS:
+                    if (param_val == 0UL || param_val > 60000UL) {
+                        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                        return;
+                    }
+                    cll->p2_max_ms = param_val;
+                    break;
+                case CP_P2_STAR_MS:
+                    if (param_val == 0UL || param_val > 60000UL) {
+                        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                        return;
+                    }
+                    cll->p2_star_ms = param_val;
+                    break;
+                case CP_P3_PHYS_MS:
+                    if (param_val > 60000UL) {
+                        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                        return;
+                    }
+                    cll->p3_phys_ms = param_val;
+                    break;
+                case CP_P3_FUNC_MS:
+                    if (param_val > 60000UL) {
+                        emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                        return;
+                    }
+                    cll->p3_func_ms = param_val;
+                    break;
+                default:
+                    emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_ERR_FCT_NOT_SUPPORTED, NULL, 0U);
+                    return;
+            }
+
+            emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_NOERROR, NULL, 0U);
+            return;
         }
+
+        case PDU_CMD_GET_COMPARAM: {
+            dpdu_cll_t *cll = get_cll(state, cmd->cll_id);
+            if (cll == NULL || cmd->length < 1U) {
+                emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                return;
+            }
+            uint16_t param_id = (cmd->length >= 2U) ? read_u16_le(&cmd->payload[0]) : cmd->payload[0];
+            uint32_t val = 0UL;
+            switch (param_id) {
+                case CP_BAUDRATE:          val = cll->baudrate_bps;    break;
+                case CP_CAN_PHYS_REQ_ID:   val = cll->can_req_id;      break;
+                case CP_CAN_RESP_USDT_ID:  val = cll->can_resp_id;     break;
+                case CP_ADDRESSING_TYPE:   val = cll->addressing_type; break;
+                case CP_CAN_FILLER_BYTE:   val = cll->can_filler_byte; break;
+                case CP_BLOCK_SIZE:        val = cll->isotp_bs;        break;
+                case CP_ST_MIN:            val = cll->isotp_stmin;     break;
+                case CP_N_BS_MS:           val = cll->isotp_n_bs_ms;   break;
+                case CP_N_CR_MS:           val = cll->isotp_n_cr_ms;   break;
+                case CP_P2_MAX_MS:         val = cll->p2_max_ms;       break;
+                case CP_P2_STAR_MS:        val = cll->p2_star_ms;      break;
+                case CP_P3_PHYS_MS:        val = cll->p3_phys_ms;      break;
+                case CP_P3_FUNC_MS:        val = cll->p3_func_ms;      break;
+                default:
+                    emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_ERR_FCT_NOT_SUPPORTED, NULL, 0U);
+                    return;
+            }
+            uint8_t rsp[6];
+            write_u16_le(&rsp[0], param_id);
+            write_u32_le(&rsp[2], val);
+            emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_NOERROR, rsp, sizeof(rsp));
+            return;
+        }
+
+        case PDU_CMD_START_COP: {
+            /* Requirement 7 StartComPrimitive payload:
+             * [ NumSendCycles (1B) | NumRecvCycles (1B) | CycleTime_ms (2B) | CAN_ID (4B) | N-PDU (1..4095B) ]
+             */
+            dpdu_cll_t *cll = get_cll(state, cmd->cll_id);
+            if (cll == NULL || cmd->cop_id == 0U || cmd->length < 9U) {
+                emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                return;
+            }
+            if (!cll->online) {
+                emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_NOT_CONN, NULL, 0U);
+                return;
+            }
+
+            const uint8_t *cmd_pld       = (cmd->length > DPDU_CMD_INLINE_MAX && cmd->ext_payload != NULL)
+                                         ? cmd->ext_payload
+                                         : cmd->payload;
+            uint8_t        num_send      = cmd_pld[0];
+            uint8_t        num_recv      = cmd_pld[1];
+            uint16_t       cycle_time_ms = read_u16_le(&cmd_pld[2]);
+            uint32_t       req_can_id    = read_u32_le(&cmd_pld[4]);
+            const uint8_t *npdu          = &cmd_pld[8];
+            uint16_t       npdu_len      = (uint16_t)(cmd->length - 8U);
+
+            if (num_send == 0U || npdu_len == 0U || npdu_len > VCI_ISOTP_MAX_PDU_LEN) {
+                emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                return;
+            }
+
+            uint8_t          status_code = PDU_STATUS_NOERROR;
+            dpdu_cop_slot_t *admitted_slot = NULL;
+
+            portENTER_CRITICAL(&s_vci_spinlock);
+            if (cll->cop_count >= VCI_CLL_COP_QUEUE_DEPTH) {
+                /* Requirement 3: Reject 5th queued ComPrimitive on this CLL with Overrun NACK */
+                status_code = PDU_ERR_COMM_PC_TO_VCI_OVERRUN;
+            } else if (npdu_len > DPDU_COP_INLINE_PDU_MAX && state->large_tx_in_use) {
+                status_code = PDU_ERR_COMM_PC_TO_VCI_OVERRUN;
+            } else {
+                dpdu_cop_slot_t *slot   = &cll->cop_queue[cll->cop_tail];
+                slot->in_use            = false; /* Enabled after synchronous 0x80 ACK is emitted */
+                slot->started           = false;
+                slot->cancel_requested  = false;
+                slot->cll_id            = cmd->cll_id;
+                slot->cop_id            = cmd->cop_id;
+                slot->num_send_cycles   = num_send;
+                slot->num_recv_cycles   = num_recv;
+                slot->send_cycles_done  = 0U;
+                slot->cycle_time_ms     = cycle_time_ms;
+                slot->next_cycle_tx_us  = 0LL;
+                slot->req_can_id        = (req_can_id != 0UL) ? req_can_id : cll->can_req_id;
+                slot->pdu_len           = npdu_len;
+
+                if (npdu_len <= DPDU_COP_INLINE_PDU_MAX) {
+                    slot->uses_large_tx_buf = false;
+                    memcpy(slot->pdu, npdu, npdu_len);
+                } else {
+                    slot->uses_large_tx_buf = true;
+                    state->large_tx_in_use  = true;
+                    memmove(isotp_mf_pool_get_large_tx_buf(), npdu, npdu_len);
+                }
+
+                cll->cop_tail = (uint8_t)((cll->cop_tail + 1U) % VCI_CLL_COP_QUEUE_DEPTH);
+                admitted_slot = slot;
+            }
+            portEXIT_CRITICAL(&s_vci_spinlock);
+
+            /* Emit synchronous 0x80 ACK/NACK before Core 1 starts executing the slot */
+            emit_ack(send_fn, cmd->cll_id, cmd->cop_id, status_code, NULL, 0U);
+
+            if (admitted_slot != NULL) {
+                portENTER_CRITICAL(&s_vci_spinlock);
+                admitted_slot->in_use = true;
+                cll->cop_count++;
+                portEXIT_CRITICAL(&s_vci_spinlock);
+            }
+            return;
+        }
+
+        case PDU_CMD_CANCEL_COP: {
+            /* Out-of-Band Priority CancelComPrimitive */
+            if (cmd->cll_id > VCI_MAX_CLLS) {
+                emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_INVALID_ARG, NULL, 0U);
+                return;
+            }
+
+            portENTER_CRITICAL(&s_vci_spinlock);
+            for (uint8_t c = 0U; c < VCI_MAX_CLLS; c++) {
+                dpdu_cll_t *cll = &state->clls[c];
+                if (cmd->cll_id != 0U && cll->cll_id != cmd->cll_id) {
+                    continue;
+                }
+                for (uint8_t s = 0U; s < VCI_CLL_COP_QUEUE_DEPTH; s++) {
+                    dpdu_cop_slot_t *slot = &cll->cop_queue[s];
+                    if (slot->in_use && (cmd->cop_id == 0U || slot->cop_id == cmd->cop_id)) {
+                        slot->cancel_requested = true;
+                    }
+                }
+            }
+            portEXIT_CRITICAL(&s_vci_spinlock);
+
+            emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_NOERROR, NULL, 0U);
+            return;
+        }
+
+        case PDU_CMD_GET_STATUS: {
+            uint8_t online_mask = 0U;
+            for (uint8_t i = 0U; i < VCI_MAX_CLLS; i++) {
+                if (state->clls[i].online) {
+                    online_mask |= (uint8_t)(1U << i);
+                }
+            }
+            dpdu_cll_t *target_cll = (cmd->cll_id >= 1U && cmd->cll_id <= VCI_MAX_CLLS)
+                                   ? &state->clls[cmd->cll_id - 1U]
+                                   : &state->clls[0];
+            uint32_t baud_bps = (state->online_cll_count > 0U)
+                              ? state->locked_baudrate_bps
+                              : target_cll->baudrate_bps;
+
+            uint8_t rsp[16];
+            rsp[0] = online_mask;
+            rsp[1] = state->bus_mode;
+            write_u16_le(&rsp[2], (uint16_t)(baud_bps / 1000UL));
+            write_u32_le(&rsp[4], state->rx_cmd_count);
+            write_u16_le(&rsp[8], (uint16_t)(state->crc_err_count & 0xFFFFU));
+            write_u32_le(&rsp[10], (uint32_t)(esp_timer_get_time() / 1000LL));
+            write_u16_le(&rsp[14], (uint16_t)(target_cll->can_req_id & 0xFFFFU));
+            emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_STATUS_NOERROR, rsp, sizeof(rsp));
+            return;
+        }
+
+        default:
+            emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_ERR_FCT_NOT_SUPPORTED, NULL, 0U);
+            return;
     }
 }
 
-static void schedule_next_p3_window(dpdu_vci_state_t *state, int64_t t_req_start_us, bool send_only)
+static void pop_cll_head_cop(dpdu_vci_state_t *state, dpdu_cll_t *cll)
 {
-    int64_t now_us = esp_timer_get_time();
-    if (state->addressing_type == DPDU_ADDR_FUNCTIONAL) {
-        /* Functional requests must respect CP_P3_FUNC_MS from request start (and at least CP_P3_PHYS_MS after completion) */
-        int64_t func_end_us = t_req_start_us + ((int64_t)state->p3_func_ms * 1000LL);
-        int64_t min_gap_us  = now_us + ((int64_t)state->p3_phys_ms * 1000LL);
-        state->next_allowed_tx_us = (func_end_us > min_gap_us) ? func_end_us : min_gap_us;
-    } else {
-        /* Physical requests enforce CP_P3_PHYS_MS after response (or CP_P2_MAX_MS if SEND_ONLY) */
-        uint32_t gap_ms = send_only ? state->p2_max_ms : state->p3_phys_ms;
-        state->next_allowed_tx_us = now_us + ((int64_t)gap_ms * 1000LL);
+    portENTER_CRITICAL(&s_vci_spinlock);
+    if (cll->cop_count > 0U) {
+        dpdu_cop_slot_t *slot = &cll->cop_queue[cll->cop_head];
+        if (slot->uses_large_tx_buf) {
+            state->large_tx_in_use = false;
+        }
+        memset(slot, 0, sizeof(*slot));
+        cll->cop_head = (uint8_t)((cll->cop_head + 1U) % VCI_CLL_COP_QUEUE_DEPTH);
+        cll->cop_count--;
     }
+    portEXIT_CRITICAL(&s_vci_spinlock);
 }
 
-static bool is_matching_diagnostic_sid(uint8_t req_sid, const uint8_t *rx_pdu, uint16_t rx_len)
+static bool is_cop_cancelled(const dpdu_cll_t *cll, const dpdu_cop_slot_t *slot)
 {
-    if (rx_len == 0U) {
+    return (!cll->online || !slot->in_use || slot->cancel_requested);
+}
+
+static bool is_matching_service_response(uint8_t req_sid, const uint8_t *rx_pdu, uint16_t rx_len)
+{
+    if (rx_pdu == NULL || rx_len == 0U) {
         return false;
     }
-    /* Positive Response: SID + 0x40 (e.g., 0x01 -> 0x41, 0x09 -> 0x49, 0x2E -> 0x6E) */
     if (rx_pdu[0] == (uint8_t)(req_sid + 0x40U)) {
         return true;
     }
-    /* Negative Response: [0x7F, req_sid, NRC] */
     if (rx_len >= 3U && rx_pdu[0] == 0x7FU && rx_pdu[1] == req_sid) {
         return true;
     }
     return false;
 }
 
-static void execute_start_cop(
+static void update_cll_p3_deadline(dpdu_cll_t *cll, uint32_t req_can_id, int64_t ref_time_us)
+{
+    bool is_func = (cll->addressing_type == DPDU_ADDR_FUNCTIONAL ||
+                    req_can_id == 0x7DFUL ||
+                    req_can_id == 0x18DB33F1UL);
+    uint32_t p3_ms = is_func ? cll->p3_func_ms : cll->p3_phys_ms;
+    cll->next_allowed_tx_us = ref_time_us + ((int64_t)p3_ms * 1000LL);
+}
+
+static void execute_one_cop_cycle(
     dpdu_vci_state_t *state,
-    const dpdu_frame_t *cmd,
-    dpdu_emit_evt_fn_t emit_fn
+    dpdu_cll_t *cll,
+    dpdu_cop_slot_t *slot,
+    dpdu_send_pkt_fn_t send_fn
 )
 {
-    /* Validate state in case link was disconnected while command was queued */
-    uint8_t val_status = dpdu_validate_start_cop(state, cmd);
-    if (val_status != PDU_STATUS_NOERROR) {
-        emit_error(emit_fn, cmd, PDU_ERR_CAN_BUS_OFF, val_status);
-        return;
-    }
+    uint8_t        cll_id   = cll->cll_id;
+    uint8_t        cop_id   = slot->cop_id;
+    uint32_t       req_id   = (slot->req_can_id != 0UL) ? slot->req_can_id : cll->can_req_id;
+    const uint8_t *tx_pdu   = slot->uses_large_tx_buf ? isotp_mf_pool_get_large_tx_buf() : slot->pdu;
+    uint16_t       pdu_len  = slot->pdu_len;
+    uint8_t        req_sid  = tx_pdu[0];
 
-    uint8_t cop_type       = cmd->payload[0];
-    const uint8_t *pdu_req = &cmd->payload[2];
-    uint16_t pdu_req_len   = cmd->length - 2U;
-    uint8_t req_sid        = pdu_req[0];
+    bool is_func = (cll->addressing_type == DPDU_ADDR_FUNCTIONAL ||
+                    req_id == 0x7DFUL ||
+                    req_id == 0x18DB33F1UL);
 
-    /* Check if cancel was requested before starting CAN transmission */
-    if (s_cancel_check_fn != NULL && s_cancel_check_fn(NULL)) {
-        emit_error(emit_fn, cmd, PDU_ERR_CANCELLED, req_sid);
-        return;
-    }
-
-    /* 1. Enforce CP_P3_PHYS_MS / CP_P3_FUNC_MS inter-request timing before transmitting */
-    enforce_p3_inter_request_delay(state);
-
-    /* Re-check cancel after P3 delay */
-    if (s_cancel_check_fn != NULL && s_cancel_check_fn(NULL)) {
-        emit_error(emit_fn, cmd, PDU_ERR_CANCELLED, req_sid);
-        return;
-    }
-
-    /* 2. Build ISO-TP Configuration from the 13-ComParam Table */
     isotp_config_t isotp_cfg = {
-        .can_req_id      = state->can_req_id,
-        .can_resp_id     = state->can_resp_id,
-        .addressing_type = (uint8_t)state->addressing_type,
-        .can_filler_byte = (uint8_t)state->can_filler_byte,
-        .fc_bs           = (uint8_t)state->isotp_bs,
-        .fc_stmin        = (uint8_t)state->isotp_stmin,
-        .n_bs_ms         = state->isotp_n_bs_ms,
-        .n_cr_ms         = state->isotp_n_cr_ms,
+        .cll_id          = cll_id,
+        .can_req_id      = req_id,
+        .can_resp_id     = cll->can_resp_id,
+        .addressing_type = is_func ? DPDU_ADDR_FUNCTIONAL : DPDU_ADDR_PHYSICAL,
+        .can_filler_byte = (uint8_t)(cll->can_filler_byte & 0xFFU),
+        .fc_bs           = (uint8_t)(cll->isotp_bs & 0xFFU),
+        .fc_stmin        = (uint8_t)(cll->isotp_stmin & 0xFFU),
+        .n_bs_ms         = cll->isotp_n_bs_ms,
+        .n_cr_ms         = cll->isotp_n_cr_ms,
     };
 
-    /* 3. Transmit PDU over ISO-TP / CAN HAL (PDU_EVT_CMD_ACK was already emitted on Core 0 admission) */
-    int64_t t_start_us = esp_timer_get_time();
-    esp_err_t tx_err = isotp_send_pdu(&isotp_cfg, pdu_req, pdu_req_len);
+    if (!slot->started) {
+        slot->started = true;
+        emit_it_status(send_fn, cll_id, cop_id, PDU_COPST_EXECUTING);
+    }
+
+    /* Drain any stale CAN frames before starting TX */
+    vci_can_frame_t stale;
+    while (can_hal_recv(&stale, 0) == ESP_OK) {
+    }
+    led_status_pulse_activity();
+
+    int64_t tx_start_us = esp_timer_get_time();
+    esp_err_t tx_err = isotp_send_pdu(&isotp_cfg, tx_pdu, pdu_len);
     if (tx_err != ESP_OK) {
-        uint8_t err_code = (tx_err == ESP_ERR_TIMEOUT) ? PDU_ERR_ISOTP_TIMEOUT : PDU_ERR_CAN_BUS_OFF;
-        emit_error(emit_fn, cmd, err_code, (uint8_t)tx_err);
+        uint16_t err_code = (tx_err == ESP_ERR_TIMEOUT) ? PDU_ERR_EVT_RX_TIMEOUT : PDU_ERR_EVT_TX_ERROR;
+        uint16_t sub_code = (tx_err == ESP_ERR_TIMEOUT) ? PDU_ERR_ISOTP_TIMEOUT  : PDU_ERR_CAN_BUS_OFF;
+        emit_it_error(send_fn, cll_id, cop_id, err_code, sub_code);
+        pop_cll_head_cop(state, cll);
+        emit_it_status(send_fn, cll_id, cop_id, PDU_COPST_FINISHED);
         return;
     }
 
-    if (cop_type == PDU_COPT_SEND_ONLY) {
-        schedule_next_p3_window(state, t_start_us, true);
+    /* SEND_ONLY primitive (NumRecvCycles == 0) */
+    if (slot->num_recv_cycles == 0U) {
+        update_cll_p3_deadline(cll, req_id, is_func ? tx_start_us : esp_timer_get_time());
+        slot->send_cycles_done++;
+        if (slot->num_send_cycles != 0xFFU && slot->send_cycles_done >= slot->num_send_cycles) {
+            pop_cll_head_cop(state, cll);
+            emit_it_status(send_fn, cll_id, cop_id, PDU_COPST_FINISHED);
+        } else {
+            slot->next_cycle_tx_us = esp_timer_get_time() + ((int64_t)slot->cycle_time_ms * 1000LL);
+        }
         return;
     }
 
-    /* 4. Wait for ECU response within CP_P2_MAX_MS (or CP_P2_STAR_MS on NRC 0x78, or CP_N_CR_MS during Multi-Frame) */
-    int64_t deadline_us = esp_timer_get_time() + ((int64_t)state->p2_max_ms * 1000LL);
-    vci_can_frame_t rx_frame;
-    static isotp_rx_ctx_t rx_ctx;
-    isotp_rx_init(&rx_ctx);
+    /* SENDRECV primitive: bind the CLL's 8B SF buffer and 3x 4,095B MF pool */
+    isotp_rx_ctx_t rx_ctx;
+    isotp_rx_init(&rx_ctx, cll->sf_rx_buf);
+
+    uint32_t p2_ms      = (cll->p2_max_ms > 0UL)   ? cll->p2_max_ms       : 50UL;
+    uint32_t p2_star_ms = (cll->p2_star_ms > 0UL)  ? cll->p2_star_ms      : 5000UL;
+    uint32_t n_cr_ms    = (cll->isotp_n_cr_ms > 0UL) ? cll->isotp_n_cr_ms : 1000UL;
+
+    int64_t deadline_us = tx_start_us + ((int64_t)p2_ms * 1000LL);
+    uint8_t recv_count  = 0U;
 
     while (esp_timer_get_time() < deadline_us) {
-        /* Check if Host sent out-of-band PDU_CMD_CANCEL_COP while ComPrimitive is in flight */
-        if (s_cancel_check_fn != NULL && s_cancel_check_fn(NULL)) {
-            emit_error(emit_fn, cmd, PDU_ERR_CANCELLED, req_sid);
+        if (is_cop_cancelled(cll, slot)) {
+            isotp_rx_release(&rx_ctx);
+            pop_cll_head_cop(state, cll);
+            emit_it_status(send_fn, cll_id, cop_id, PDU_COPST_CANCELLED);
             return;
         }
 
@@ -419,284 +968,179 @@ static void execute_start_cop(
             wait_ms = 1U;
         }
 
-        if (can_hal_recv(&rx_frame, wait_ms) == ESP_OK) {
-            isotp_rx_status_t st = isotp_rx_feed_frame(&rx_ctx, &rx_frame, &isotp_cfg);
+        vci_can_frame_t rx_frame;
+        if (can_hal_recv(&rx_frame, wait_ms) != ESP_OK) {
+            continue;
+        }
 
-            if (st == ISOTP_RX_IN_PROGRESS) {
-                /* Multi-Frame FF or intermediate CF received; reset deadline to CP_N_CR_MS */
-                deadline_us = esp_timer_get_time() + ((int64_t)state->isotp_n_cr_ms * 1000LL);
-            } else if (st == ISOTP_RX_COMPLETE) {
-                /* Verify SID matches Positive Response (SID + 0x40) or Negative Response (0x7F + SID) */
-                if (!is_matching_diagnostic_sid(req_sid, rx_ctx.pdu, rx_ctx.total_len)) {
-                    isotp_rx_init(&rx_ctx);
-                    continue;
+        isotp_rx_status_t status = isotp_rx_feed_frame(&rx_ctx, &rx_frame, &isotp_cfg);
+
+        if (status == ISOTP_RX_IN_PROGRESS) {
+            deadline_us = esp_timer_get_time() + ((int64_t)n_cr_ms * 1000LL);
+            continue;
+        }
+
+        if (status == ISOTP_RX_ERR_SEQ || status == ISOTP_RX_ERR_OVERFLOW || status == ISOTP_RX_ERR_FC_TX) {
+            isotp_rx_release(&rx_ctx);
+            update_cll_p3_deadline(cll, req_id, esp_timer_get_time());
+            emit_it_error(send_fn, cll_id, cop_id, PDU_ERR_EVT_PROT_ERR, PDU_ERR_MALFORMED_FRAME);
+            pop_cll_head_cop(state, cll);
+            emit_it_status(send_fn, cll_id, cop_id, PDU_COPST_FINISHED);
+            return;
+        }
+
+        if (status == ISOTP_RX_COMPLETE) {
+            const uint8_t *pdu_ptr = rx_ctx.completed_pdu;
+            uint16_t       rx_len  = rx_ctx.total_len;
+
+            if (!is_matching_service_response(req_sid, pdu_ptr, rx_len)) {
+                isotp_rx_release(&rx_ctx);
+                continue;
+            }
+
+            /* Check for UDS/OBD Negative Response 0x7F [SID] 0x78 (ResponsePending) */
+            if (rx_len >= 3U &&
+                pdu_ptr[0] == 0x7FU &&
+                pdu_ptr[1] == req_sid &&
+                pdu_ptr[2] == 0x78U) {
+                isotp_rx_release(&rx_ctx);
+                deadline_us = esp_timer_get_time() + ((int64_t)p2_star_ms * 1000LL);
+                continue;
+            }
+
+            /* Valid response assembled! Emit 0x81 PDU_IT_RESULT with 100 us hardware timestamp */
+            uint32_t rx_ts_us = dpdu_timestamp_us();
+            emit_it_result(send_fn, cll_id, cop_id, rx_ts_us, rx_ctx.rx_can_id, 0U, pdu_ptr, rx_len);
+            isotp_rx_release(&rx_ctx);
+            recv_count++;
+
+            if (recv_count >= slot->num_recv_cycles) {
+                update_cll_p3_deadline(cll, req_id, is_func ? tx_start_us : esp_timer_get_time());
+                slot->send_cycles_done++;
+                if (slot->num_send_cycles != 0xFFU && slot->send_cycles_done >= slot->num_send_cycles) {
+                    pop_cll_head_cop(state, cll);
+                    emit_it_status(send_fn, cll_id, cop_id, PDU_COPST_FINISHED);
+                } else {
+                    slot->next_cycle_tx_us = esp_timer_get_time() + ((int64_t)slot->cycle_time_ms * 1000LL);
                 }
-
-                /* Check for UDS/OBD Negative Response 0x7F [SID] 0x78 (ResponsePending) */
-                if (rx_ctx.total_len >= 3U &&
-                    rx_ctx.pdu[0] == 0x7FU &&
-                    rx_ctx.pdu[1] == req_sid &&
-                    rx_ctx.pdu[2] == 0x78U) {
-                    /* Extend timeout to CP_P2_STAR_MS (5000ms default) and re-arm ISO-TP RX */
-                    isotp_rx_init(&rx_ctx);
-                    deadline_us = esp_timer_get_time() + ((int64_t)state->p2_star_ms * 1000LL);
-                    continue;
-                }
-
-                uint16_t elapsed_ms = (uint16_t)((esp_timer_get_time() - t_start_us) / 1000LL);
-                schedule_next_p3_window(state, t_start_us, false);
-                led_status_pulse_activity();
-                emit_result(emit_fn, cmd, rx_ctx.rx_can_id, elapsed_ms, rx_ctx.pdu, rx_ctx.total_len);
-                return;
-            } else if (st == ISOTP_RX_ERR_SEQ || st == ISOTP_RX_ERR_OVERFLOW || st == ISOTP_RX_ERR_FC_TX) {
-                schedule_next_p3_window(state, t_start_us, false);
-                emit_error(emit_fn, cmd, PDU_ERR_MALFORMED_FRAME, (uint8_t)st);
                 return;
             }
         }
     }
 
-    schedule_next_p3_window(state, t_start_us, false);
-
-    /* Timeout expired: distinguish Multi-Frame CP_N_CR_MS timeout from initial CP_P2_MAX_MS timeout */
-    if (rx_ctx.in_progress) {
-        emit_error(emit_fn, cmd, PDU_ERR_ISOTP_TIMEOUT, req_sid);
-    } else {
-        emit_error(emit_fn, cmd, PDU_ERR_P2_TIMEOUT, req_sid);
+    /* Timeout reached: if we already received >= 1 functional response in a multi-ECU window, finish cleanly */
+    if (recv_count > 0U && !rx_ctx.in_progress) {
+        isotp_rx_release(&rx_ctx);
+        update_cll_p3_deadline(cll, req_id, is_func ? tx_start_us : esp_timer_get_time());
+        slot->send_cycles_done++;
+        if (slot->num_send_cycles != 0xFFU && slot->send_cycles_done >= slot->num_send_cycles) {
+            pop_cll_head_cop(state, cll);
+            emit_it_status(send_fn, cll_id, cop_id, PDU_COPST_FINISHED);
+        } else {
+            slot->next_cycle_tx_us = esp_timer_get_time() + ((int64_t)slot->cycle_time_ms * 1000LL);
+        }
+        return;
     }
+
+    /* Otherwise emit 0x83 PDU_IT_ERROR (PDU_ERR_EVT_RX_TIMEOUT) with P2 or ISOTP subcode */
+    bool was_mf_in_progress = rx_ctx.in_progress;
+    isotp_rx_release(&rx_ctx);
+    update_cll_p3_deadline(cll, req_id, is_func ? tx_start_us : esp_timer_get_time());
+    emit_it_error(
+        send_fn,
+        cll_id,
+        cop_id,
+        PDU_ERR_EVT_RX_TIMEOUT,
+        was_mf_in_progress ? PDU_ERR_ISOTP_TIMEOUT : PDU_ERR_P2_TIMEOUT
+    );
+    pop_cll_head_cop(state, cll);
+    emit_it_status(send_fn, cll_id, cop_id, PDU_COPST_FINISHED);
 }
 
-void dpdu_engine_process_cmd(
+bool dpdu_engine_step_round_robin(
     dpdu_vci_state_t *state,
-    const dpdu_frame_t *cmd,
-    dpdu_emit_evt_fn_t emit_fn
+    dpdu_send_pkt_fn_t send_fn
 )
 {
-    state->rx_cmd_count++;
-    led_status_pulse_activity();
+    if (state == NULL) {
+        return false;
+    }
 
-    switch (cmd->opcode) {
-        case PDU_CMD_CONNECT: {
-            if (cmd->length < 1U) {
-                emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                return;
+    /* First, immediately drain any cancelled ComPrimitives across all 8 CLLs */
+    for (uint8_t c = 0U; c < VCI_MAX_CLLS; c++) {
+        dpdu_cll_t *cll = &state->clls[c];
+        while (cll->cop_count > 0U) {
+            dpdu_cop_slot_t *head = &cll->cop_queue[cll->cop_head];
+            if (!head->cancel_requested) {
+                break;
             }
-            uint8_t  bus_mode = cmd->payload[0];
-            uint16_t baud_khz = (uint16_t)(state->baudrate_bps / 1000U);
-            uint8_t  flags    = 0U;
+            uint8_t cll_id = cll->cll_id;
+            uint8_t cop_id = head->cop_id;
+            pop_cll_head_cop(state, cll);
+            emit_it_status(send_fn, cll_id, cop_id, PDU_COPST_CANCELLED);
+        }
 
-            if (cmd->length >= 3U) {
-                uint16_t req_baud_khz = read_u16_le(&cmd->payload[1]);
-                if (req_baud_khz != 0U) {
-                    baud_khz = req_baud_khz;
+        /* Also check non-head slots in the 4-slot queue if a specific COP_ID was cancelled */
+        if (cll->cop_count > 1U) {
+            portENTER_CRITICAL(&s_vci_spinlock);
+            dpdu_cop_slot_t compacted[VCI_CLL_COP_QUEUE_DEPTH];
+            uint8_t         compacted_cnt = 0U;
+            uint8_t         cancelled_ids[VCI_CLL_COP_QUEUE_DEPTH];
+            uint8_t         cancelled_cnt = 0U;
+
+            for (uint8_t i = 0U; i < cll->cop_count; i++) {
+                uint8_t idx = (uint8_t)((cll->cop_head + i) % VCI_CLL_COP_QUEUE_DEPTH);
+                dpdu_cop_slot_t *slot = &cll->cop_queue[idx];
+                if (slot->cancel_requested) {
+                    if (slot->uses_large_tx_buf) {
+                        state->large_tx_in_use = false;
+                    }
+                    cancelled_ids[cancelled_cnt++] = slot->cop_id;
+                } else {
+                    compacted[compacted_cnt++] = *slot;
                 }
             }
-            if (cmd->length >= 4U) {
-                flags = cmd->payload[3];
+            if (cancelled_cnt > 0U) {
+                memset(cll->cop_queue, 0, sizeof(cll->cop_queue));
+                for (uint8_t i = 0U; i < compacted_cnt; i++) {
+                    cll->cop_queue[i] = compacted[i];
+                }
+                cll->cop_head  = 0U;
+                cll->cop_tail  = (uint8_t)(compacted_cnt % VCI_CLL_COP_QUEUE_DEPTH);
+                cll->cop_count = compacted_cnt;
             }
+            portEXIT_CRITICAL(&s_vci_spinlock);
 
-            uint32_t baud_bps = (uint32_t)baud_khz * 1000U;
-            if ((bus_mode != VCI_BUS_MODE_SIM_LOOPBACK && bus_mode != VCI_BUS_MODE_PHYSICAL_CAN) ||
-                !is_valid_baudrate_bps(&baud_bps)) {
-                emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                return;
+            for (uint8_t i = 0U; i < cancelled_cnt; i++) {
+                emit_it_status(send_fn, cll->cll_id, cancelled_ids[i], PDU_COPST_CANCELLED);
             }
-
-            if (can_hal_start(bus_mode, (uint16_t)(baud_bps / 1000U)) != ESP_OK) {
-                emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                return;
-            }
-
-            state->connected          = true;
-            state->bus_mode           = bus_mode;
-            state->baudrate_bps       = baud_bps;
-            state->connect_flags      = flags;
-            state->next_allowed_tx_us = 0LL;
-            led_status_set_mode(VCI_LED_CONNECTED_IDLE);
-
-            uint8_t info[4];
-            info[0] = state->bus_mode;
-            write_u16_le(&info[1], (uint16_t)(state->baudrate_bps / 1000U));
-            info[3] = state->connect_flags;
-            emit_ack(emit_fn, cmd, PDU_STATUS_NOERROR, info, sizeof(info));
-            return;
         }
-
-        case PDU_CMD_DISCONNECT: {
-            can_hal_stop();
-            state->connected = false;
-            led_status_set_mode(VCI_LED_DISCONNECTED);
-            emit_ack(emit_fn, cmd, PDU_STATUS_NOERROR, NULL, 0);
-            return;
-        }
-
-        case PDU_CMD_SET_COMPARAM: {
-            if (cmd->length < 5U) {
-                emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                return;
-            }
-            uint8_t  param_id  = cmd->payload[0];
-            uint32_t param_val = read_u32_le(&cmd->payload[1]);
-
-            switch (param_id) {
-                case CP_BAUDRATE:
-                    if (!is_valid_baudrate_bps(&param_val)) {
-                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                        return;
-                    }
-                    state->baudrate_bps = param_val;
-                    if (state->connected) {
-                        (void)can_hal_start(state->bus_mode, (uint16_t)(state->baudrate_bps / 1000U));
-                    }
-                    break;
-                case CP_CAN_PHYS_REQ_ID:
-                    state->can_req_id = param_val;
-                    break;
-                case CP_CAN_RESP_USDT_ID:
-                    state->can_resp_id = param_val;
-                    break;
-                case CP_ADDRESSING_TYPE:
-                    if (param_val > DPDU_ADDR_PHYSICAL) {
-                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                        return;
-                    }
-                    state->addressing_type = param_val;
-                    break;
-                case CP_CAN_FILLER_BYTE:
-                    if (param_val > 0xFFU) {
-                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                        return;
-                    }
-                    state->can_filler_byte = param_val;
-                    break;
-                case CP_BLOCK_SIZE:
-                    if (param_val > 0xFFU) {
-                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                        return;
-                    }
-                    state->isotp_bs = param_val;
-                    break;
-                case CP_ST_MIN:
-                    if (param_val > 0xFFU) {
-                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                        return;
-                    }
-                    state->isotp_stmin = param_val;
-                    break;
-                case CP_N_BS_MS:
-                    if (param_val == 0U || param_val > 60000U) {
-                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                        return;
-                    }
-                    state->isotp_n_bs_ms = param_val;
-                    break;
-                case CP_N_CR_MS:
-                    if (param_val == 0U || param_val > 60000U) {
-                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                        return;
-                    }
-                    state->isotp_n_cr_ms = param_val;
-                    break;
-                case CP_P2_MAX_MS:
-                    if (param_val == 0U || param_val > 60000U) {
-                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                        return;
-                    }
-                    state->p2_max_ms = param_val;
-                    break;
-                case CP_P2_STAR_MS:
-                    if (param_val == 0U || param_val > 60000U) {
-                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                        return;
-                    }
-                    state->p2_star_ms = param_val;
-                    break;
-                case CP_P3_PHYS_MS:
-                    if (param_val > 60000U) {
-                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                        return;
-                    }
-                    state->p3_phys_ms = param_val;
-                    break;
-                case CP_P3_FUNC_MS:
-                    if (param_val > 60000U) {
-                        emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                        return;
-                    }
-                    state->p3_func_ms = param_val;
-                    break;
-                default:
-                    emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                    return;
-            }
-
-            uint8_t echo[5];
-            echo[0] = param_id;
-            write_u32_le(&echo[1], param_val);
-            emit_ack(emit_fn, cmd, PDU_STATUS_NOERROR, echo, sizeof(echo));
-            return;
-        }
-
-        case PDU_CMD_GET_COMPARAM: {
-            if (cmd->length < 1U) {
-                emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                return;
-            }
-            uint8_t  param_id  = cmd->payload[0];
-            uint32_t param_val = 0;
-
-            switch (param_id) {
-                case CP_BAUDRATE:         param_val = state->baudrate_bps;    break;
-                case CP_CAN_PHYS_REQ_ID:  param_val = state->can_req_id;      break;
-                case CP_CAN_RESP_USDT_ID: param_val = state->can_resp_id;     break;
-                case CP_ADDRESSING_TYPE:  param_val = state->addressing_type; break;
-                case CP_CAN_FILLER_BYTE:  param_val = state->can_filler_byte; break;
-                case CP_BLOCK_SIZE:       param_val = state->isotp_bs;        break;
-                case CP_ST_MIN:           param_val = state->isotp_stmin;     break;
-                case CP_N_BS_MS:          param_val = state->isotp_n_bs_ms;   break;
-                case CP_N_CR_MS:          param_val = state->isotp_n_cr_ms;   break;
-                case CP_P2_MAX_MS:        param_val = state->p2_max_ms;       break;
-                case CP_P2_STAR_MS:       param_val = state->p2_star_ms;      break;
-                case CP_P3_PHYS_MS:       param_val = state->p3_phys_ms;      break;
-                case CP_P3_FUNC_MS:       param_val = state->p3_func_ms;      break;
-                default:
-                    emit_ack(emit_fn, cmd, PDU_STATUS_INVALID_ARG, NULL, 0);
-                    return;
-            }
-
-            uint8_t out[5];
-            out[0] = param_id;
-            write_u32_le(&out[1], param_val);
-            emit_ack(emit_fn, cmd, PDU_STATUS_NOERROR, out, sizeof(out));
-            return;
-        }
-
-        case PDU_CMD_GET_STATUS: {
-            uint8_t stat[20];
-            uint32_t uptime_ms = (uint32_t)(esp_timer_get_time() / 1000LL);
-            stat[0] = state->connected ? 1U : 0U;
-            stat[1] = state->bus_mode;
-            write_u16_le(&stat[2], (uint16_t)(state->baudrate_bps / 1000U));
-            write_u32_le(&stat[4], state->rx_cmd_count);
-            write_u32_le(&stat[8], state->crc_err_count);
-            write_u32_le(&stat[12], uptime_ms);
-            write_u32_le(&stat[16], state->can_req_id);
-            emit_ack(emit_fn, cmd, PDU_STATUS_NOERROR, stat, sizeof(stat));
-            return;
-        }
-
-        case PDU_CMD_START_COP: {
-            execute_start_cop(state, cmd, emit_fn);
-            return;
-        }
-
-        case PDU_CMD_CANCEL_COP: {
-            emit_ack(emit_fn, cmd, PDU_STATUS_NOERROR, NULL, 0);
-            return;
-        }
-
-        default:
-            emit_ack(emit_fn, cmd, PDU_STATUS_UNSUPPORTED, NULL, 0);
-            return;
     }
+
+    /* Second, step Round-Robin across the 8 CLLs to pick the next ready ComPrimitive */
+    int64_t now_us = esp_timer_get_time();
+    for (uint8_t attempt = 0U; attempt < VCI_MAX_CLLS; attempt++) {
+        uint8_t idx = state->rr_cll_idx;
+        state->rr_cll_idx = (uint8_t)((state->rr_cll_idx + 1U) % VCI_MAX_CLLS);
+
+        dpdu_cll_t *cll = &state->clls[idx];
+        if (!cll->online || cll->cop_count == 0U) {
+            continue;
+        }
+
+        dpdu_cop_slot_t *head = &cll->cop_queue[cll->cop_head];
+        if (!head->in_use) {
+            continue;
+        }
+
+        /* Respect both Cyclic period (next_cycle_tx_us) and P3Phys/P3Func (next_allowed_tx_us) */
+        if (now_us < head->next_cycle_tx_us || now_us < cll->next_allowed_tx_us) {
+            continue;
+        }
+
+        execute_one_cop_cycle(state, cll, head, send_fn);
+        return true;
+    }
+
+    return false;
 }

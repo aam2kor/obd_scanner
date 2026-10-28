@@ -17,8 +17,9 @@
 
 static const char *TAG = "ble_nus";
 
-static ble_nus_rx_cb_t s_rx_cb      = NULL;
-static uint16_t        s_conn_hdl   = BLE_HS_CONN_HANDLE_NONE;
+static ble_nus_rx_cb_t         s_rx_cb         = NULL;
+static ble_nus_disconnect_cb_t s_disconnect_cb = NULL;
+static uint16_t                s_conn_hdl      = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t        s_tx_val_hdl = 0;
 static uint8_t         s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 static bool            s_tx_notify_enabled = false;
@@ -120,6 +121,9 @@ static int ble_nus_gap_event(struct ble_gap_event *event, void *arg)
             ESP_LOGI(TAG, "BLE Central disconnected (reason=%d)", event->disconnect.reason);
             s_conn_hdl = BLE_HS_CONN_HANDLE_NONE;
             s_tx_notify_enabled = false;
+            if (s_disconnect_cb != NULL) {
+                s_disconnect_cb();
+            }
             ble_nus_start_advertising();
             return 0;
 
@@ -252,6 +256,11 @@ esp_err_t ble_nus_init(ble_nus_rx_cb_t rx_cb)
 
     nimble_port_freertos_init(ble_nus_host_task);
     return ESP_OK;
+}
+
+void ble_nus_set_disconnect_cb(ble_nus_disconnect_cb_t disconnect_cb)
+{
+    s_disconnect_cb = disconnect_cb;
 }
 
 bool ble_nus_is_connected(void)

@@ -46,9 +46,9 @@ static bool s_dtcs_cleared = false;
 static bool is_valid_tester_req_id(uint32_t id, bool is_extd)
 {
     if (!is_extd) {
-        return (id == OBD_FUNC_REQ_ID_11 || id == OBD_ECU1_REQ_ID_11);
+        return (id == OBD_FUNC_REQ_ID_11 || (id >= 0x7E0U && id <= 0x7E7U));
     }
-    return (id == OBD_FUNC_REQ_ID_29 || id == OBD_ECU1_REQ_ID_29);
+    return (id == OBD_FUNC_REQ_ID_29 || (id & 0xFFFF00FFU) == 0x18DA00F1U);
 }
 
 static void send_sf_response(const uint8_t *pdu, uint8_t pdu_len)
@@ -131,6 +131,8 @@ static void send_isotp_response(const uint8_t *pdu, uint16_t pdu_len)
 
         if (stmin > 0U && stmin <= 0x7FU) {
             esp_rom_delay_us((uint32_t)stmin * 1000U);
+        } else if (stmin >= 0xF1U && stmin <= 0xF9U) {
+            esp_rom_delay_us((uint32_t)(stmin - 0xF0U) * 100U);
         } else {
             esp_rom_delay_us(500); /* 0.5 ms inter-frame spacing */
         }
@@ -378,7 +380,20 @@ static void ecu_sim_task(void *arg)
         }
 
         s_active_is_extd   = rx.is_extd;
-        s_active_resp_id   = rx.is_extd ? OBD_ECU1_RESP_ID_29 : OBD_ECU1_RESP_ID_11;
+        if (!rx.is_extd) {
+            if (rx.id >= 0x7E0U && rx.id <= 0x7E7U) {
+                s_active_resp_id = rx.id + 8U;
+            } else {
+                s_active_resp_id = OBD_ECU1_RESP_ID_11;
+            }
+        } else {
+            if ((rx.id & 0xFFFF00FFU) == 0x18DA00F1U) {
+                uint32_t ecu_sa = (rx.id >> 8) & 0xFFU;
+                s_active_resp_id = 0x18DAF100U | ecu_sa;
+            } else {
+                s_active_resp_id = OBD_ECU1_RESP_ID_29;
+            }
+        }
         s_last_rx_pad_byte = rx.data[7];
 
         uint8_t pci_type = (rx.data[0] >> 4) & 0x0FU;
