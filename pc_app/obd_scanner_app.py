@@ -140,16 +140,23 @@ class LeanDpduBleClient:
         cop_id: int = 0,
         timeout: float = 2.0,
     ) -> DpduFrame:
+        if msg_type != 0x05 and cop_id == 0:
+            cop_id = self.alloc_cop_id()
         req = DpduFrame(msg_type=msg_type, cll_id=cll_id, cop_id=cop_id, status=0, payload=payload)
-        await self.client.write_gatt_char(NUS_RX_CHAR_UUID, req.encode(), response=False)
+        encoded = req.encode()
         skipped: list[DpduFrame] = []
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            f = await self.recv_frame(timeout=max(0.05, deadline - time.time()))
-            if f.msg_type == PDU_EVT_CMD_ACK and f.cll_id == cll_id and f.cop_id == cop_id:
-                self._deferred = skipped + self._deferred
-                return f
-            skipped.append(f)
+        for _attempt in range(3):
+            await self.client.write_gatt_char(NUS_RX_CHAR_UUID, encoded, response=False)
+            attempt_deadline = time.time() + min(0.5, timeout)
+            try:
+                while time.time() < attempt_deadline:
+                    f = await self.recv_frame(timeout=max(0.05, attempt_deadline - time.time()))
+                    if f.msg_type == PDU_EVT_CMD_ACK and f.cll_id == cll_id and f.cop_id == cop_id:
+                        self._deferred = skipped + self._deferred
+                        return f
+                    skipped.append(f)
+            except asyncio.TimeoutError:
+                continue
         raise TimeoutError("Timed out waiting for 0x80 synchronous Command ACK over BLE")
 
     async def pdu_ioctl(self, ioctl_id: int) -> DpduFrame:
@@ -190,8 +197,11 @@ class LeanDpduBleClient:
             payload = struct.pack("<BHB", bus_mode, baud_khz, flags)
         ack = await self.send_and_recv_ack(PDU_CMD_CONNECT, payload=payload, cll_id=cll_id)
         if ack.status == PDU_STATUS_NOERROR:
-            st_evt = await self.recv_frame(timeout=1.0)
-            assert st_evt.msg_type == PDU_IT_STATUS
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                st_evt = await self.recv_frame(timeout=max(0.05, deadline - time.time()))
+                if st_evt.msg_type == PDU_IT_STATUS and st_evt.cll_id == cll_id:
+                    break
         return ack
 
     async def pdu_disconnect(self, cll_id: int = 1) -> DpduFrame:

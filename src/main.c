@@ -26,10 +26,17 @@ static dpdu_vci_state_t  s_vci_state;
 /* Mutex serializing outgoing VCI -> Host wire packets from Core 0 (0x80 ACK) and Core 1 (0x81/0x82/0x83) */
 static SemaphoreHandle_t s_host_tx_mutex       = NULL;
 static TaskHandle_t      s_vci_rt_task_hdl     = NULL;
+static TaskHandle_t      s_host_io_task_hdl    = NULL;
 
 /* Separate 0xAA55 stream parsers for BLE NUS and USB-UART0 (~96 bytes each in .bss) */
 static dpdu_rx_parser_t  s_ble_parser;
 static dpdu_rx_parser_t  s_uart_parser;
+
+/* Single-producer (NimBLE task) / single-consumer (host_io_task) BLE RX ringbuffer (512B) */
+#define BLE_RX_RING_SIZE         512U
+static uint8_t           s_ble_rx_ring[BLE_RX_RING_SIZE];
+static volatile uint16_t s_ble_rx_head = 0U;
+static volatile uint16_t s_ble_rx_tail = 0U;
 
 /* Flag set on BLE GATT disconnect to trigger autonomous PDUDestruct within < 100 ms */
 static volatile bool     s_ble_destruct_pending = false;
@@ -176,27 +183,27 @@ static void on_ble_nus_disconnect(void)
 
 /**
  * @brief Callback invoked on Core 0 when bytes arrive over BLE NUS RX Characteristic.
+ *        Enqueues bytes into the lock-free SPSC ringbuffer so NimBLE's GATT callback
+ *        returns immediately and frees the ATT RX mbuf without re-entrant notifications.
  */
 static void on_ble_nus_rx(const uint8_t *data, size_t len)
 {
+    uint16_t head = s_ble_rx_head;
     for (size_t i = 0U; i < len; i++) {
-        dpdu_parse_result_t res = dpdu_parser_feed_byte(&s_ble_parser, data[i]);
-        if (res == DPDU_PARSE_OK) {
-            dpdu_engine_handle_host_cmd(&s_vci_state, &s_ble_parser.frame, host_send_packet);
-            if (s_vci_rt_task_hdl != NULL) {
-                xTaskNotifyGive(s_vci_rt_task_hdl);
-            }
-        } else if (res == DPDU_PARSE_ERR_CRC) {
-            s_vci_state.crc_err_count++;
-            emit_rx_framing_error(s_ble_parser.frame.cll_id, s_ble_parser.frame.cop_id, PDU_ERR_CRC_MISMATCH);
-        } else if (res == DPDU_PARSE_ERR_HDR) {
-            emit_rx_framing_error(0U, 0U, PDU_ERR_MALFORMED_FRAME);
+        uint16_t next = (uint16_t)((head + 1U) % BLE_RX_RING_SIZE);
+        if (next != s_ble_rx_tail) {
+            s_ble_rx_ring[head] = data[i];
+            head = next;
         }
+    }
+    s_ble_rx_head = head;
+    if (s_host_io_task_hdl != NULL) {
+        xTaskNotifyGive(s_host_io_task_hdl);
     }
 }
 
 /**
- * @brief Core 0 Task: Reads raw bytes from Host (UART0), runs the 0xAA55 + CRC-16
+ * @brief Core 0 Task: Reads raw bytes from Host (BLE NUS & UART0), runs the 0xAA55 + CRC-16
  *        stream parser, and dispatches synchronous ACK/NACK & queue admission.
  */
 static void host_io_task(void *arg)
@@ -207,26 +214,61 @@ static void host_io_task(void *arg)
     dpdu_parser_init(&s_uart_parser);
 
     while (1) {
-        int rx_len = uart_read_bytes(
-            VCI_HOST_UART_NUM,
-            rx_chunk,
-            sizeof(rx_chunk),
-            pdMS_TO_TICKS(5)
-        );
+        bool had_activity = false;
 
-        for (int i = 0; i < rx_len; i++) {
-            dpdu_parse_result_t res = dpdu_parser_feed_byte(&s_uart_parser, rx_chunk[i]);
+        /* 1. Drain any pending BLE NUS RX bytes first */
+        uint16_t tail = s_ble_rx_tail;
+        while (tail != s_ble_rx_head) {
+            had_activity = true;
+            uint8_t byte = s_ble_rx_ring[tail];
+            tail = (uint16_t)((tail + 1U) % BLE_RX_RING_SIZE);
+            s_ble_rx_tail = tail;
+
+            dpdu_parse_result_t res = dpdu_parser_feed_byte(&s_ble_parser, byte);
             if (res == DPDU_PARSE_OK) {
-                dpdu_engine_handle_host_cmd(&s_vci_state, &s_uart_parser.frame, host_send_packet);
+                dpdu_engine_handle_host_cmd(&s_vci_state, &s_ble_parser.frame, host_send_packet);
                 if (s_vci_rt_task_hdl != NULL) {
                     xTaskNotifyGive(s_vci_rt_task_hdl);
                 }
             } else if (res == DPDU_PARSE_ERR_CRC) {
                 s_vci_state.crc_err_count++;
-                emit_rx_framing_error(s_uart_parser.frame.cll_id, s_uart_parser.frame.cop_id, PDU_ERR_CRC_MISMATCH);
+                emit_rx_framing_error(s_ble_parser.frame.cll_id, s_ble_parser.frame.cop_id, PDU_ERR_CRC_MISMATCH);
             } else if (res == DPDU_PARSE_ERR_HDR) {
                 emit_rx_framing_error(0U, 0U, PDU_ERR_MALFORMED_FRAME);
             }
+        }
+
+        /* 2. Read USB-UART0 without blocking for a full 256B buffer timeout */
+        size_t buffered = 0U;
+        (void)uart_get_buffered_data_len(VCI_HOST_UART_NUM, &buffered);
+        int rx_len = 0;
+        if (buffered > 0U) {
+            size_t to_read = (buffered < sizeof(rx_chunk)) ? buffered : sizeof(rx_chunk);
+            rx_len = uart_read_bytes(VCI_HOST_UART_NUM, rx_chunk, to_read, 0);
+        } else if (!ble_nus_is_connected()) {
+            rx_len = uart_read_bytes(VCI_HOST_UART_NUM, rx_chunk, 1U, 1);
+        }
+
+        if (rx_len > 0) {
+            had_activity = true;
+            for (int i = 0; i < rx_len; i++) {
+                dpdu_parse_result_t res = dpdu_parser_feed_byte(&s_uart_parser, rx_chunk[i]);
+                if (res == DPDU_PARSE_OK) {
+                    dpdu_engine_handle_host_cmd(&s_vci_state, &s_uart_parser.frame, host_send_packet);
+                    if (s_vci_rt_task_hdl != NULL) {
+                        xTaskNotifyGive(s_vci_rt_task_hdl);
+                    }
+                } else if (res == DPDU_PARSE_ERR_CRC) {
+                    s_vci_state.crc_err_count++;
+                    emit_rx_framing_error(s_uart_parser.frame.cll_id, s_uart_parser.frame.cop_id, PDU_ERR_CRC_MISMATCH);
+                } else if (res == DPDU_PARSE_ERR_HDR) {
+                    emit_rx_framing_error(0U, 0U, PDU_ERR_MALFORMED_FRAME);
+                }
+            }
+        }
+
+        if (!had_activity && ble_nus_is_connected()) {
+            (void)ulTaskNotifyTake(pdTRUE, 1);
         }
     }
 }
@@ -292,7 +334,7 @@ void app_main(void)
         4096,
         NULL,
         VCI_PRIO_HOST_IO_TASK,
-        NULL,
+        &s_host_io_task_hdl,
         VCI_CORE_HOST_IO
     );
     ESP_ERROR_CHECK(io_rc == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);

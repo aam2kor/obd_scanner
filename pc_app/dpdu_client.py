@@ -259,7 +259,7 @@ class LeanDpduSerialClient:
     """PC Host ISO 22900-2 App-Device IF Client over USB-UART0."""
 
     def __init__(self, port: str = "/dev/ttyUSB0", baud: int = 115200):
-        self.ser = serial.Serial(port, baud, timeout=0.02)
+        self.ser = serial.Serial(port, baud, timeout=0.005)
         self.parser = DpduStreamParser()
         self._rx_queue: list[DpduFrame] = []
         self._next_cop_id = 1
@@ -275,7 +275,10 @@ class LeanDpduSerialClient:
         time.sleep(0.1)
         self.ser.reset_input_buffer()
         self.ser.rts = False
-        time.sleep(1.0)
+        time.sleep(1.2)
+        while self.ser.in_waiting:
+            self.ser.read(self.ser.in_waiting)
+            time.sleep(0.01)
         self.ser.reset_input_buffer()
         self.parser.reset()
         self._rx_queue.clear()
@@ -290,7 +293,8 @@ class LeanDpduSerialClient:
             return self._rx_queue.pop(0)
         deadline = time.time() + timeout
         while time.time() < deadline:
-            chunk = self.ser.read(256)
+            n_avail = self.ser.in_waiting
+            chunk = self.ser.read(n_avail if n_avail > 0 else 1)
             for b in chunk:
                 frame = self.parser.feed_byte(b)
                 if frame is not None:
@@ -322,6 +326,8 @@ class LeanDpduSerialClient:
         cop_id: int = 0,
         timeout: float = 1.0,
     ) -> DpduFrame:
+        if msg_type != PDU_CMD_CANCEL_COP and cop_id == 0:
+            cop_id = self.alloc_cop_id()
         self.send_raw_cmd(msg_type, payload=payload, cll_id=cll_id, cop_id=cop_id)
         deferred: list[DpduFrame] = []
         deadline = time.time() + timeout
@@ -389,8 +395,11 @@ class LeanDpduSerialClient:
         ack = self.send_and_recv_ack(PDU_CMD_CONNECT, payload=payload, cll_id=cll_id)
         if ack.status == PDU_STATUS_NOERROR:
             # Consume the PDU_CLLST_ONLINE (0x82) state transition event
-            st_evt = self.recv_frame(timeout=0.5)
-            assert st_evt.msg_type == PDU_IT_STATUS
+            deadline = time.time() + 0.5
+            while time.time() < deadline:
+                st_evt = self.recv_frame(timeout=max(0.05, deadline - time.time()))
+                if st_evt.msg_type == PDU_IT_STATUS and st_evt.cll_id == cll_id:
+                    break
         return ack
 
     def pdu_disconnect(self, cll_id: int = 1) -> DpduFrame:

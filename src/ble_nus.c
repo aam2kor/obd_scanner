@@ -10,6 +10,7 @@
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/ble_att.h"
+#include "host/ble_gatt.h"
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
@@ -60,14 +61,15 @@ static int gatt_nus_chr_access(
         uint16_t om_len = OS_MBUF_PKTLEN(ctxt->om);
         if (om_len > 0 && s_rx_cb != NULL) {
             uint8_t buf[256];
-            while (ctxt->om != NULL) {
-                uint16_t chunk_len = ctxt->om->om_len;
+            const struct os_mbuf *cur = ctxt->om;
+            while (cur != NULL) {
+                uint16_t chunk_len = cur->om_len;
                 if (chunk_len > sizeof(buf)) {
                     chunk_len = sizeof(buf);
                 }
-                memcpy(buf, ctxt->om->om_data, chunk_len);
+                memcpy(buf, cur->om_data, chunk_len);
                 s_rx_cb(buf, chunk_len);
-                ctxt->om = SLIST_NEXT(ctxt->om, om_next);
+                cur = SLIST_NEXT(cur, om_next);
             }
         }
         return 0;
@@ -109,6 +111,7 @@ static int ble_nus_gap_event(struct ble_gap_event *event, void *arg)
             if (event->connect.status == 0) {
                 s_conn_hdl = event->connect.conn_handle;
                 s_tx_notify_enabled = true;
+                (void)ble_gattc_exchange_mtu(s_conn_hdl, NULL, NULL);
                 ESP_LOGI(TAG, "BLE Central connected (conn_handle=%u)", s_conn_hdl);
             } else {
                 s_conn_hdl = BLE_HS_CONN_HANDLE_NONE;
@@ -286,11 +289,17 @@ esp_err_t ble_nus_send(const uint8_t *data, size_t len)
         if (chunk > max_chunk) {
             chunk = max_chunk;
         }
-        struct os_mbuf *om = ble_hs_mbuf_from_flat(&data[offset], (uint16_t)chunk);
-        if (om == NULL) {
-            return ESP_ERR_NO_MEM;
+        int rc = BLE_HS_ENOMEM;
+        for (int retry = 0; retry < 5; retry++) {
+            struct os_mbuf *om = ble_hs_mbuf_from_flat(&data[offset], (uint16_t)chunk);
+            if (om != NULL) {
+                rc = ble_gatts_notify_custom(s_conn_hdl, s_tx_val_hdl, om);
+                if (rc != BLE_HS_ENOMEM) {
+                    break;
+                }
+            }
+            vTaskDelay(1);
         }
-        int rc = ble_gatts_notify_custom(s_conn_hdl, s_tx_val_hdl, om);
         if (rc != 0) {
             return ESP_FAIL;
         }
