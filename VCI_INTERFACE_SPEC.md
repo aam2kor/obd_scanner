@@ -12,9 +12,11 @@ Both transports carry the **exact same binary ISO 22900-2:2022 `App-Device IF` p
 | Parameter | Value |
 | :--- | :--- |
 | **BLE Advertised Name** | `ESP32-OBD-VCI` |
+| **Security Mode / Level** | **LE Security Mode 1, Level 2** (*Unauthenticated Pairing with AES-CCM Encryption — Just Works + NVS Bonding*) |
+| **IO Capability & Key Dist** | `NoInputNoOutput` (`BLE_HS_IO_NO_INPUT_OUTPUT`), `MITM=0`, `SC=1`, `Bonding=1` (`ENC` + `ID` keys in NVS) |
 | **NUS Service UUID** | `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` |
-| **RX Characteristic UUID (Host → VCI)** | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` (`Write` / `Write Without Response`) |
-| **TX Characteristic UUID (VCI → Host)** | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` (`Notify` — subscribe to CCCD on connect) |
+| **RX Characteristic UUID (Host → VCI)** | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` (`Write` / `Write Without Response`, requires `BLE_GATT_CHR_F_WRITE_ENC` encrypted link) |
+| **TX Characteristic UUID (VCI → Host)** | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` (`Notify` — subscribe to CCCD on connect; notifications gated by link encryption) |
 | **Preferred ATT MTU** | `256` bytes (payloads larger than `MTU - 3` are fragmented automatically; store-and-forward reassembly via the stream parser) |
 | **Wireless Link-Loss Safety** | If BLE GATT disconnects (`BLE_GAP_EVENT_DISCONNECT`), the VCI autonomously executes an internal `PDUDestruct` within `< 100 ms` (halting cyclic primitives, aborting in-flight ISO-TP transfers, clearing all 8 CLLs, and stopping CAN). |
 

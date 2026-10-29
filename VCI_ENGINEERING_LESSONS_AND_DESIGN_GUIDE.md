@@ -115,11 +115,15 @@ flowchart TD
   - Small packets (`payload_len <= 256 B`) are encoded into a static `266 B` `small_wire` buffer via `dpdu_encode_packet()` and sent atomically.
   - Large Multi-Frame packets (`payload_len > 256 B`, up to `4,104 B`) compute the `CRC16-CCITT` in-place over `[8B Header]` + `[In-Place Pool Payload]` and stream `[Header (8B)]`, `[Payload (N B)]`, and `[CRC (2B)]` directly to `uart_write_bytes()` and `ble_nus_send()` without allocating a `4.1 KB` contiguous wire buffer.
 
-### 3.2 `ble_nus.c` / `ble_nus.h` — Layer 1 Wireless Transport (NimBLE GATT NUS)
+### 3.2 `ble_nus.c` / `ble_nus.h` — Layer 1 Wireless Transport (NimBLE GATT NUS + LE Security Mode 1, Level 2)
 - **GATT Service Table (`s_gatt_nus_svcs`):**
   - **Primary Service UUID:** `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` (Nordic UART Service).
-  - **RX Characteristic (`6E400002-...`):** `BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP` (Host → VCI commands).
-  - **TX Characteristic (`6E400003-...`):** `BLE_GATT_CHR_F_NOTIFY` (VCI → Host synchronous ACKs and asynchronous Result/Status/Error Event Items).
+  - **RX Characteristic (`6E400002-...`):** `BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC` (Host → VCI commands; enforces **LE Security Mode 1, Level 2** encrypted link).
+  - **TX Characteristic (`6E400003-...`):** `BLE_GATT_CHR_F_NOTIFY` (VCI → Host synchronous ACKs and asynchronous Result/Status/Error Event Items; gated by `ble_nus_is_encrypted()`).
+- **LE Security Mode 1, Level 2 (Unauthenticated Pairing + AES-CCM Encryption + NVS Bonding):**
+  - Configured in `ble_nus_init()` via `ble_hs_cfg`: `sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT` ("Just Works"), `sm_bonding = 1`, `sm_mitm = 0`, `sm_sc = 1` (LE Secure Connections ECDH P-256 with Legacy fallback), `sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID`, and `ble_store_config_init()` (`CONFIG_BT_NIMBLE_NVS_PERSIST=y` in `sdkconfig.esp32dev`).
+  - Handles `BLE_GAP_EVENT_ENC_CHANGE` (updates `s_conn_encrypted`) and `BLE_GAP_EVENT_REPEAT_PAIRING` (deletes stale peer bond via `ble_store_util_delete_peer(&desc.peer_id_addr)` and returns `BLE_GAP_REPEAT_PAIRING_RETRY`).
+  - Inside `gatt_nus_chr_access()`, explicitly verifies `desc.sec_state.encrypted` on every `BLE_GATT_ACCESS_OP_WRITE_CHR` (since `Write Without Response` bypasses ATT-level error responses unless checked in the access callback) and triggers `ble_gap_security_initiate(conn_handle)` + `BLE_ATT_ERR_INSUFFICIENT_ENC` if unencrypted.
 - **GAP Advertising & Connection Management:**
   - Advertises device name `ESP32-OBD-VCI` in the primary advertisement packet and the 128-bit NUS UUID in the scan response packet (`20–40 ms` advertising interval, discovered in `49.9 ms` average).
   - On `BLE_GAP_EVENT_CONNECT`, immediately initiates `ble_gattc_exchange_mtu(s_conn_hdl, NULL, NULL)` (`256 B` preferred MTU).
@@ -296,6 +300,14 @@ sequenceDiagram
 - **Requirement (ISO 22900-2):** If a wireless diagnostic session drops while cyclic or multi-frame ComPrimitives are active on the vehicle CAN bus, the VCI must autonomously abort all in-flight CAN activity and transition all CLLs to `PDU_CLLST_OFFLINE` within `< 100 ms`.
 - **Implementation Pattern:** In `BLE_GAP_EVENT_DISCONNECT`, set `cancel_requested = true` across all 8 CLLs × 4 queue slots, set `s_ble_destruct_pending = true`, and immediately wake `vci_rt_task` on Core 1 via `xTaskNotifyGive()`. Hardware benchmarks confirmed full autonomous teardown in **`48.4 ms`** (`< 100 ms` target).
 
+### Lesson 8.5: LE Security Mode 1, Level 2 ("Just Works" Encryption) & BlueZ D-Bus Agent Pitfalls
+- **Architectural Requirement:** Because `ESP32-OBD-VCI` is a headless vehicle dongle with no display or keypad (`BLE_HS_IO_NO_INPUT_OUTPUT`), **LE Security Mode 1, Level 2** (*Unauthenticated Pairing with AES-CCM Encryption — "Just Works" + NVS Bonding*) is the highest Bluetooth Core Spec security level achievable without out-of-band/static passkey entry.
+- **Pitfall 1 (`Write Without Response` Bypasses ATT Flag Checks Unless Verified in Callback):**
+  - Setting `BLE_GATT_CHR_F_WRITE_ENC` on the NUS RX characteristic causes NimBLE to return `BLE_ATT_ERR_INSUFFICIENT_ENC (0x0F)` on an `ATT Write Request` (`response=True`), which triggers SMP pairing on the Central. However, `ATT Write Command` (`Write Without Response`, `response=False`) has no ATT error response PDU. Always verify `desc.sec_state.encrypted` inside `gatt_nus_chr_access()` and inside `ble_nus_send()` so unencrypted `Write Without Response` frames are never admitted into the D-PDU engine.
+- **Pitfall 2 (Peripheral-Initiated `Security Request` at `t = 0 ms` Collides with BlueZ GATT Discovery):**
+  - Calling `ble_gap_security_initiate(s_conn_hdl)` synchronously inside `BLE_GAP_EVENT_CONNECT` sends an unsolicited SMP `Security Request` while Linux `BlueZ` is still performing initial GATT Primary Service Discovery, causing BlueZ to invoke `org.bluez.Agent1.RequestAuthorization` on the desktop GUI (timing out after 30 seconds on headless CLI runs) or dropping service discovery.
+  - **Best Practice:** Let `connect()` complete GATT discovery cleanly, register a lightweight `NoInputNoOutput` `org.bluez.Agent1` via `dbus_fast` on Linux hosts (`ensure_bluez_just_works_agent()`), and trigger `await client.pair()` (or GATT write encryption elevation) immediately after `connect()`. Enable `CONFIG_BT_NIMBLE_NVS_PERSIST=y` (`ble_store_config_init()`) so subsequent connections re-encrypt in `< 50 ms` using the NVS-persisted LTK.
+
 ---
 
 ## 9. USB-UART0 High-Speed Binary Framing Lessons Learned
@@ -361,4 +373,5 @@ sequenceDiagram
 - [x] **Non-Blocking Serial Reads:** Use `in_waiting` (Host) and `uart_get_buffered_data_len()` (MCU) instead of fixed-size `read(256)` calls that stall until the read timeout expires.
 - [x] **Strict Event Ordering:** Emit `0x80` `CMD_ACK` *before* marking a queue slot `in_use = true` for the real-time core.
 - [x] **Zero-Copy Multi-Frame Pool:** Pre-allocate `9 bytes` of header padding directly in front of each `4,095 B` ISO-TP RX buffer (`result_hdr_pad[9]`) and stream large packets in chunks to avoid `4.1 KB` intermediate copies.
+- [x] **LE Security Mode 1, Level 2 ("Just Works" + NVS Bonding):** Configure `BLE_HS_IO_NO_INPUT_OUTPUT`, `sm_bonding = 1`, `sm_sc = 1`, `BLE_GATT_CHR_F_WRITE_ENC`, NVS bond persistence (`ble_store_config_init()`), and explicit `desc.sec_state.encrypted` verification inside `gatt_nus_chr_access()`.
 - [x] **Safety on Link Loss:** Hook `BLE_GAP_EVENT_DISCONNECT` to cancel all active ComPrimitives and transition all CLLs offline within `< 100 ms` (`48.4 ms` measured).

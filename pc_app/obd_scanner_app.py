@@ -143,6 +143,56 @@ def format_stmin_value(val: int) -> str:
     return f"0x{val:02X} ({val} ms)"
 
 
+_BLUEZ_AGENT_BUS = None
+
+
+async def ensure_bluez_just_works_agent():
+    """Register a NoInputNoOutput D-Bus Agent1 on Linux BlueZ so LE Security Mode 1, Level 2 pairs unattended."""
+    global _BLUEZ_AGENT_BUS
+    if _BLUEZ_AGENT_BUS is not None:
+        return
+    try:
+        from dbus_fast.aio import MessageBus
+        from dbus_fast.service import ServiceInterface, method
+        from dbus_fast import BusType
+
+        class _JustWorksAgent(ServiceInterface):
+            def __init__(self):
+                super().__init__("org.bluez.Agent1")
+
+            @method()
+            def Release(self):
+                pass
+
+            @method()
+            def RequestConfirmation(self, device: "o", passkey: "u"):
+                return
+
+            @method()
+            def RequestAuthorization(self, device: "o"):
+                return
+
+            @method()
+            def AuthorizeService(self, device: "o", uuid: "s"):
+                return
+
+            @method()
+            def Cancel(self):
+                pass
+
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        agent_path = "/org/bluez/VciJustWorksAgent"
+        bus.export(agent_path, _JustWorksAgent())
+        introspection = await bus.introspect("org.bluez", "/org/bluez")
+        proxy = bus.get_proxy_object("org.bluez", "/org/bluez", introspection)
+        agent_mgr = proxy.get_interface("org.bluez.AgentManager1")
+        await agent_mgr.call_register_agent(agent_path, "NoInputNoOutput")
+        await agent_mgr.call_request_default_agent(agent_path)
+        _BLUEZ_AGENT_BUS = bus
+    except Exception:
+        pass
+
+
 class LeanDpduBleClient:
     """Async PC Host ISO 22900-2 App-Device IF Client over Bluetooth LE (Nordic UART Service)."""
 
@@ -169,32 +219,70 @@ class LeanDpduBleClient:
     async def connect_ble(self, scan_timeout: float = 8.0) -> str:
         from bleak import BleakClient, BleakScanner
 
-        target_device = None
-        if self.address:
-            target_device = await BleakScanner.find_device_by_address(self.address, timeout=scan_timeout)
-        else:
-            devices = await BleakScanner.discover(timeout=scan_timeout, return_adv=True)
-            for dev, adv in devices.values():
-                adv_name = dev.name or adv.local_name or ""
-                service_uuids = [u.lower() for u in (adv.service_uuids or [])]
+        await ensure_bluez_just_works_agent()
+
+        last_err = None
+        for _attempt in range(3):
+            target_device = None
+            found_evt = asyncio.Event()
+
+            def _on_detect(device, adv_data):
+                nonlocal target_device
+                if self.address and device.address.upper() == self.address.upper():
+                    if not found_evt.is_set():
+                        target_device = device
+                        found_evt.set()
+                    return
+                adv_name = device.name or adv_data.local_name or ""
+                service_uuids = [u.lower() for u in (adv_data.service_uuids or [])]
                 if adv_name == self.device_name or NUS_SERVICE_UUID in service_uuids:
-                    target_device = dev
-                    break
+                    if not found_evt.is_set():
+                        target_device = device
+                        found_evt.set()
 
-        if target_device is None:
-            raise RuntimeError(
-                f"Could not find BLE VCI '{self.device_name}' (NUS UUID {NUS_SERVICE_UUID}). "
-                f"Ensure the ESP32 is powered and advertising."
-            )
+            scanner = BleakScanner(detection_callback=_on_detect)
+            await scanner.start()
+            try:
+                await asyncio.wait_for(found_evt.wait(), timeout=scan_timeout)
+                await asyncio.sleep(0.4)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                await scanner.stop()
+                await asyncio.sleep(0.2)
 
-        self.client = BleakClient(target_device)
-        await self.client.connect()
-        self.parser.reset()
-        self._deferred.clear()
-        while not self._rx_queue.empty():
-            self._rx_queue.get_nowait()
-        await self.client.start_notify(NUS_TX_CHAR_UUID, self._on_nus_tx_notify)
-        return f"{target_device.name or self.device_name} [{target_device.address}]"
+            if target_device is None:
+                last_err = RuntimeError(
+                    f"Could not find BLE VCI '{self.device_name}' (NUS UUID {NUS_SERVICE_UUID}). "
+                    f"Ensure the ESP32 is powered and advertising."
+                )
+                continue
+
+            try:
+                self.client = BleakClient(target_device)
+                await self.client.connect()
+                try:
+                    await self.client.pair()
+                except Exception:
+                    pass
+                self.parser.reset()
+                self._deferred.clear()
+                while not self._rx_queue.empty():
+                    self._rx_queue.get_nowait()
+                await self.client.start_notify(NUS_TX_CHAR_UUID, self._on_nus_tx_notify)
+                return f"{target_device.name or self.device_name} [{target_device.address}] (LE Security Mode 1, Level 2)"
+            except Exception as e:
+                last_err = e
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                if "disconnected" in str(e).lower() and getattr(target_device, "address", None):
+                    import subprocess
+                    subprocess.run(["bluetoothctl", "remove", target_device.address], capture_output=True)
+                await asyncio.sleep(0.4)
+
+        raise last_err or RuntimeError("BLE connection failed")
 
     async def close(self):
         if self.client and self.client.is_connected:
@@ -223,7 +311,7 @@ class LeanDpduBleClient:
         encoded = req.encode()
         skipped: list[DpduFrame] = []
         for _attempt in range(3):
-            await self.client.write_gatt_char(NUS_RX_CHAR_UUID, encoded, response=False)
+            await self.client.write_gatt_char(NUS_RX_CHAR_UUID, encoded, response=(_attempt > 0))
             attempt_deadline = time.time() + min(0.5, timeout)
             try:
                 while time.time() < attempt_deadline:

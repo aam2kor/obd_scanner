@@ -43,6 +43,11 @@ void ble_nus_set_disconnect_cb(ble_nus_disconnect_cb_t disconnect_cb);
 bool ble_nus_is_connected(void);
 
 /**
+ * @brief Check whether the active BLE connection is encrypted (LE Security Mode 1, Level 2+).
+ */
+bool ble_nus_is_encrypted(void);
+
+/**
  * @brief Send raw D-PDU wire bytes to the connected BLE Central via NUS TX notifications.
  *        Automatically fragments payloads larger than (ATT_MTU - 3).
  */
