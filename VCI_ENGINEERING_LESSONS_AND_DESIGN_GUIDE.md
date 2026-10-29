@@ -14,7 +14,7 @@
 2. [Hardware Pinout, FreeRTOS Task Topology & Dual-Core Assignment](#2-hardware-pinout-freertos-task-topology--dual-core-assignment)
 3. [Detailed Module-by-Module Software Design (ESP32 Firmware)](#3-detailed-module-by-module-software-design-esp32-firmware)
    - [3.1 `main.c` — Dual-Core Orchestrator, Host I/O & Zero-Copy Wire Transmitter](#31-mainc--dual-core-orchestrator-host-io--zero-copy-wire-transmitter)
-   - [3.2 `ble_nus.c` / `ble_nus.h` — Layer 1 Wireless Transport (NimBLE GATT NUS)](#32-ble_nusc--ble_nush--layer-1-wireless-transport-nimble-gatt-nus)
+   - [3.2 `ble_nus.c` / `ble_nus.h` — Layer 1 Wireless Transport (NimBLE GATT NUS + DIS + LE Security Mode 1, Level 2)](#32-ble_nusc--ble_nush--layer-1-wireless-transport-nimble-gatt-nus--dis--le-security-mode-1-level-2)
    - [3.3 `dpdu_protocol.c` / `dpdu_protocol.h` — Layer 2 ISO 22900-2 `App-Device IF` Engine](#33-dpdu_protocolc--dpdu_protocolh--layer-2-iso-22900-2-app-device-if-engine)
    - [3.4 `isotp.c` / `isotp.h` — Layer 3 ISO 15765-2 (`ISO-TP`) Segmentation & Reassembly Engine](#34-isotpc--isotph--layer-3-iso-15765-2-iso-tp-segmentation--reassembly-engine)
    - [3.5 `can_hal.c` / `can_hal.h` — Layer 4 CAN Hardware Abstraction Layer (`TWAI` + Loopback)](#35-can_halc--can_halh--layer-4-can-hardware-abstraction-layer-twai--loopback)
@@ -115,11 +115,23 @@ flowchart TD
   - Small packets (`payload_len <= 256 B`) are encoded into a static `266 B` `small_wire` buffer via `dpdu_encode_packet()` and sent atomically.
   - Large Multi-Frame packets (`payload_len > 256 B`, up to `4,104 B`) compute the `CRC16-CCITT` in-place over `[8B Header]` + `[In-Place Pool Payload]` and stream `[Header (8B)]`, `[Payload (N B)]`, and `[CRC (2B)]` directly to `uart_write_bytes()` and `ble_nus_send()` without allocating a `4.1 KB` contiguous wire buffer.
 
-### 3.2 `ble_nus.c` / `ble_nus.h` — Layer 1 Wireless Transport (NimBLE GATT NUS + LE Security Mode 1, Level 2)
+### 3.2 `ble_nus.c` / `ble_nus.h` — Layer 1 Wireless Transport (NimBLE GATT NUS + DIS + LE Security Mode 1, Level 2)
 - **GATT Service Table (`s_gatt_nus_svcs`):**
   - **Primary Service UUID:** `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` (Nordic UART Service).
   - **RX Characteristic (`6E400002-...`):** `BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC` (Host → VCI commands; enforces **LE Security Mode 1, Level 2** encrypted link).
   - **TX Characteristic (`6E400003-...`):** `BLE_GATT_CHR_F_NOTIFY` (VCI → Host synchronous ACKs and asynchronous Result/Status/Error Event Items; gated by `ble_nus_is_encrypted()`).
+- **Standard Bluetooth SIG Device Information Service (DIS `0x180A`):**
+  - **Architectural Motivation:** Enables host operating systems, Android/iOS scanning apps, and diagnostic tool suites to inspect device metadata (Manufacturer, Model, Serial Number, Hardware Revision, Firmware Revision, Software Revision) *before* initiating LE pairing or establishing an encrypted channel.
+  - **eFuse-Derived Serial Number:** Dynamically queries the ESP32's burned factory MAC address (`esp_efuse_mac_get_default()`) at boot and formats it as an uppercase hex string (e.g., `A4:F0:0F:77:87:CC`), ensuring globally unique device traceability across production units.
+  - **Kconfig Configuration (`sdkconfig.esp32dev`):**
+    - `CONFIG_BT_NIMBLE_DIS_SERVICE=y`
+    - `CONFIG_BT_NIMBLE_SVC_DIS_MANUFACTURER_NAME=y` (`"OpenVCI"`)
+    - `CONFIG_BT_NIMBLE_SVC_DIS_MODEL_NUMBER=y` (`"ESP32-OBD-VCI"`)
+    - `CONFIG_BT_NIMBLE_SVC_DIS_SERIAL_NUMBER=y` (eFuse MAC string)
+    - `CONFIG_BT_NIMBLE_SVC_DIS_HARDWARE_REVISION=y` (`"v1.0.0"`)
+    - `CONFIG_BT_NIMBLE_SVC_DIS_FIRMWARE_REVISION=y` (`"v2.1.0"`)
+    - `CONFIG_BT_NIMBLE_SVC_DIS_SOFTWARE_REVISION=y` (`"ISO-22900-2-D-PDU"`)
+  - **GATT Caching Lesson:** Host BLE stacks (specifically Linux BlueZ and Apple CoreBluetooth) aggressively cache service and characteristic handles by MAC. When new services like DIS `0x180A` are added to existing firmware, the host device cache must be cleared (e.g. `bluetoothctl remove <MAC>`) to force an updated GATT attribute table discovery.
 - **LE Security Mode 1, Level 2 (Unauthenticated Pairing + AES-CCM Encryption + NVS Bonding):**
   - Configured in `ble_nus_init()` via `ble_hs_cfg`: `sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT` ("Just Works"), `sm_bonding = 1`, `sm_mitm = 0`, `sm_sc = 1` (LE Secure Connections ECDH P-256 with Legacy fallback), `sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID`, and `ble_store_config_init()` (`CONFIG_BT_NIMBLE_NVS_PERSIST=y` in `sdkconfig.esp32dev`).
   - Handles `BLE_GAP_EVENT_ENC_CHANGE` (updates `s_conn_encrypted`) and `BLE_GAP_EVENT_REPEAT_PAIRING` (deletes stale peer bond via `ble_store_util_delete_peer(&desc.peer_id_addr)` and returns `BLE_GAP_REPEAT_PAIRING_RETRY`).

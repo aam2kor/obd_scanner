@@ -16,6 +16,9 @@
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+#include "services/dis/ble_svc_dis.h"
+#include "esp_mac.h"
+#include "vci_config.h"
 #include <string.h>
 
 void ble_store_config_init(void);
@@ -29,6 +32,7 @@ static uint16_t                s_tx_val_hdl         = 0;
 static uint8_t                 s_own_addr_type      = BLE_OWN_ADDR_PUBLIC;
 static bool                    s_tx_notify_enabled  = false;
 static volatile bool           s_conn_encrypted     = false;
+static char                    s_dis_serial_str[24] = {0};
 
 /* Nordic UART Service (NUS) 128-bit UUIDs (Little-Endian) */
 /* 6E400001-B5A3-F393-E0A9-E50E24DCCA9E */
@@ -284,6 +288,20 @@ esp_err_t ble_nus_init(ble_nus_rx_cb_t rx_cb)
 
     ble_svc_gap_init();
     ble_svc_gatt_init();
+    ble_svc_dis_init();
+
+    /* Populate Device Information Service (0x180A) characteristics */
+    uint8_t mac[6] = {0};
+    (void)esp_efuse_mac_get_default(mac);
+    snprintf(s_dis_serial_str, sizeof(s_dis_serial_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    (void)ble_svc_dis_manufacturer_name_set("OpenVCI");
+    (void)ble_svc_dis_model_number_set(VCI_BLE_DEVICE_NAME);
+    (void)ble_svc_dis_serial_number_set(s_dis_serial_str);
+    (void)ble_svc_dis_hardware_revision_set("v1.0.0");
+    (void)ble_svc_dis_firmware_revision_set("v2.1.0");
+    (void)ble_svc_dis_software_revision_set("ISO-22900-2-D-PDU");
 
     int rc = ble_gatts_count_cfg(s_gatt_nus_svcs);
     if (rc != 0) {

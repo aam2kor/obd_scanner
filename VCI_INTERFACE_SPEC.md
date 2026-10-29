@@ -8,17 +8,33 @@ This document specifies the transport, binary wire framing (`0xAA55`), command/e
 
 Both transports carry the **exact same binary ISO 22900-2:2022 `App-Device IF` packets**. No ASCII/AT adapter is used.
 
-### 1.1 Bluetooth LE (Nordic UART Service — NUS)
+### 1.1 Bluetooth LE (Nordic UART Service & Device Information Service)
 | Parameter | Value |
 | :--- | :--- |
 | **BLE Advertised Name** | `ESP32-OBD-VCI` |
 | **Security Mode / Level** | **LE Security Mode 1, Level 2** (*Unauthenticated Pairing with AES-CCM Encryption — Just Works + NVS Bonding*) |
 | **IO Capability & Key Dist** | `NoInputNoOutput` (`BLE_HS_IO_NO_INPUT_OUTPUT`), `MITM=0`, `SC=1`, `Bonding=1` (`ENC` + `ID` keys in NVS) |
-| **NUS Service UUID** | `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` |
-| **RX Characteristic UUID (Host → VCI)** | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` (`Write` / `Write Without Response`, requires `BLE_GATT_CHR_F_WRITE_ENC` encrypted link) |
-| **TX Characteristic UUID (VCI → Host)** | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` (`Notify` — subscribe to CCCD on connect; notifications gated by link encryption) |
 | **Preferred ATT MTU** | `256` bytes (payloads larger than `MTU - 3` are fragmented automatically; store-and-forward reassembly via the stream parser) |
 | **Wireless Link-Loss Safety** | If BLE GATT disconnects (`BLE_GAP_EVENT_DISCONNECT`), the VCI autonomously executes an internal `PDUDestruct` within `< 100 ms` (halting cyclic primitives, aborting in-flight ISO-TP transfers, clearing all 8 CLLs, and stopping CAN). |
+
+#### Exposed GATT Services & Attribute Table
+The VCI exposes standard Bluetooth SIG services alongside the proprietary diagnostic data pipe:
+
+| Service | UUID | Characteristic | UUID | Properties | Permissions & Value |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Generic Access (GAP)** | `0x1800` | Device Name | `0x2A00` | `Read` | Plaintext: `"ESP32-OBD-VCI"` |
+| | | Appearance | `0x2A01` | `Read` | `0x0000` (Generic category) |
+| **Generic Attribute (GATT)** | `0x1801` | Service Changed | `0x2A05` | `Indicate` | Notifies client of attribute changes |
+| **Device Information (DIS)** | `0x180A` | Manufacturer Name | `0x2A29` | `Read` | Unauthenticated read: `"OpenVCI"` |
+| | | Model Number | `0x2A24` | `Read` | Unauthenticated read: `"ESP32-OBD-VCI"` |
+| | | Serial Number | `0x2A25` | `Read` | Unauthenticated read: Factory eFuse MAC (e.g. `A4:F0:0F:77:87:CC`) |
+| | | Hardware Revision | `0x2A27` | `Read` | Unauthenticated read: `"v1.0.0"` |
+| | | Firmware Revision | `0x2A26` | `Read` | Unauthenticated read: `"v2.1.0"` |
+| | | Software Revision | `0x2A28` | `Read` | Unauthenticated read: `"ISO-22900-2-D-PDU"` |
+| **Nordic UART (NUS)** | `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` | RX (Host → VCI) | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` | `Write`, `Write Without Response` | **Encrypted Only (`BLE_GATT_CHR_F_WRITE_ENC`)**; carries D-PDU `0xAA55` frames |
+| | | TX (VCI → Host) | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` | `Notify` | Notifications gated by encrypted link; carries D-PDU `0xAA55` frames |
+
+*(Note: DIS `0x180A` characteristics are deliberately readable pre-pairing so diagnostic software and host operating systems can identify device models, versions, and unique serial numbers without requiring cryptographic pairing.)*
 
 ### 1.2 USB-UART (Wired Fallback)
 | Parameter | Value |
