@@ -8,6 +8,7 @@
 #include "can_hal.h"
 #include "isotp.h"
 #include "led_status.h"
+#include "ble_nus.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
@@ -685,6 +686,29 @@ void dpdu_engine_handle_host_cmd(
                 case CP_P2_STAR_MS:        val = cll->p2_star_ms;      break;
                 case CP_P3_PHYS_MS:        val = cll->p3_phys_ms;      break;
                 case CP_P3_FUNC_MS:        val = cll->p3_func_ms;      break;
+                case CP_BLE_CONN_INTERVAL:
+                case CP_BLE_CONN_LATENCY:
+                case CP_BLE_CONN_TIMEOUT_MS:
+                case CP_BLE_ATT_MTU:
+                case CP_BLE_DLE_TX_OCTETS:
+                case CP_BLE_PHY_TYPE:
+                case CP_BLE_IDLE_COUNT:
+                case CP_BLE_WAKE_COUNT: {
+                    ble_link_status_t ls;
+                    if (ble_nus_get_link_status(&ls) == ESP_OK) {
+                        if (param_id == CP_BLE_CONN_INTERVAL)        val = (uint32_t)ls.conn_itvl * 1250UL;
+                        else if (param_id == CP_BLE_CONN_LATENCY)    val = (uint32_t)ls.conn_latency;
+                        else if (param_id == CP_BLE_CONN_TIMEOUT_MS) val = (uint32_t)ls.supervision_timeout * 10UL;
+                        else if (param_id == CP_BLE_ATT_MTU)         val = (uint32_t)ls.mtu;
+                        else if (param_id == CP_BLE_DLE_TX_OCTETS)   val = (uint32_t)ls.max_tx_octets;
+                        else if (param_id == CP_BLE_PHY_TYPE)        val = (uint32_t)ls.tx_phy;
+                        else if (param_id == CP_BLE_IDLE_COUNT)      val = ls.idle_entry_count;
+                        else if (param_id == CP_BLE_WAKE_COUNT)      val = ls.active_wake_count;
+                    } else {
+                        val = 0UL;
+                    }
+                    break;
+                }
                 default:
                     emit_ack(send_fn, cmd->cll_id, cmd->cop_id, PDU_ERR_FCT_NOT_SUPPORTED, NULL, 0U);
                     return;

@@ -97,6 +97,16 @@ CP_P2_STAR_MS       = 0x000B
 CP_P3_PHYS_MS       = 0x000C
 CP_P3_FUNC_MS       = 0x000D
 
+# Vendor BLE Transport ComParams
+CP_BLE_CONN_INTERVAL    = 0xF001
+CP_BLE_CONN_LATENCY     = 0xF002
+CP_BLE_CONN_TIMEOUT_MS  = 0xF003
+CP_BLE_ATT_MTU          = 0xF004
+CP_BLE_DLE_TX_OCTETS    = 0xF005
+CP_BLE_PHY_TYPE         = 0xF006
+CP_BLE_IDLE_COUNT       = 0xF007
+CP_BLE_WAKE_COUNT       = 0xF008
+
 # Backwards-compatible aliases
 CP_ISOTP_BS         = CP_BLOCK_SIZE
 CP_ISOTP_STMIN_MS   = CP_ST_MIN

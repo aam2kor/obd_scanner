@@ -270,6 +270,11 @@ class LeanDpduBleClient:
                 while not self._rx_queue.empty():
                     self._rx_queue.get_nowait()
                 await self.client.start_notify(NUS_TX_CHAR_UUID, self._on_nus_tx_notify)
+                try:
+                    # Prime LE Security Mode 1, Level 2 encryption handshake via DIS read before writes
+                    await self.client.read_gatt_char("00002a29-0000-1000-8000-00805f9b34fb")
+                except Exception:
+                    pass
                 return f"{target_device.name or self.device_name} [{target_device.address}] (LE Security Mode 1, Level 2)"
             except Exception as e:
                 last_err = e

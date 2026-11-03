@@ -6,6 +6,7 @@
 #include "can_hal.h"
 #include "vci_config.h"
 #include "dpdu_protocol.h"
+#include "ble_nus.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #pragma GCC diagnostic push
@@ -116,6 +117,7 @@ esp_err_t can_hal_send(const vci_can_frame_t *frame, uint32_t timeout_ms)
         return ESP_ERR_INVALID_STATE;
     }
 
+    ble_nus_notify_activity();
     TickType_t ticks = ms_to_ticks(timeout_ms);
 
     if (s_bus_mode == VCI_BUS_MODE_SIM_LOOPBACK) {
@@ -145,6 +147,7 @@ esp_err_t can_hal_recv(vci_can_frame_t *frame, uint32_t timeout_ms)
 
     if (s_bus_mode == VCI_BUS_MODE_SIM_LOOPBACK) {
         if (xQueueReceive(s_q_ecu_to_tester, frame, ticks) == pdTRUE) {
+            ble_nus_notify_activity();
             return ESP_OK;
         }
         return ESP_ERR_TIMEOUT;
@@ -155,6 +158,8 @@ esp_err_t can_hal_recv(vci_can_frame_t *frame, uint32_t timeout_ms)
     if (err != ESP_OK) {
         return err;
     }
+
+    ble_nus_notify_activity();
 
     frame->id      = msg.identifier;
     frame->is_extd = msg.extd ? true : false;
@@ -180,6 +185,7 @@ esp_err_t can_hal_sim_ecu_send(const vci_can_frame_t *frame, uint32_t timeout_ms
     if (s_q_ecu_to_tester == NULL || frame == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+    ble_nus_notify_activity();
     if (xQueueSend(s_q_ecu_to_tester, frame, ms_to_ticks(timeout_ms)) == pdTRUE) {
         return ESP_OK;
     }

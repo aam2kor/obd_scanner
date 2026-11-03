@@ -121,6 +121,16 @@ typedef enum {
     CP_P2_STAR_MS                           = 0x000B, /* Default: 5000 ms */
     CP_P3_PHYS_MS                           = 0x000C, /* Default: 5 ms */
     CP_P3_FUNC_MS                           = 0x000D, /* Default: 50 ms */
+
+    /* Vendor BLE Transport ComParams */
+    CP_BLE_CONN_INTERVAL                    = 0xF001, /* Connection Interval in us (itvl * 1250) */
+    CP_BLE_CONN_LATENCY                     = 0xF002, /* Slave Latency (0 = active, 4 = idle) */
+    CP_BLE_CONN_TIMEOUT_MS                  = 0xF003, /* Supervision Timeout in ms (timeout * 10) */
+    CP_BLE_ATT_MTU                          = 0xF004, /* Negotiated ATT MTU */
+    CP_BLE_DLE_TX_OCTETS                    = 0xF005, /* Negotiated DLE Max TX Octets */
+    CP_BLE_PHY_TYPE                         = 0xF006, /* Negotiated PHY (1 = 1M, 2 = 2M) */
+    CP_BLE_IDLE_COUNT                       = 0xF007, /* Total transitions into Idle state */
+    CP_BLE_WAKE_COUNT                       = 0xF008, /* Total wakeups back to Active state */
 } dpdu_comparam_id_t;
 
 /* Addressing Types (for CP_ADDRESSING_TYPE) */
