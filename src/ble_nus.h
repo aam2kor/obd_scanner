@@ -32,6 +32,9 @@ typedef struct {
     bool     is_idle;               /* true if currently in Idle power state */
     uint32_t idle_entry_count;      /* number of transitions into Idle state */
     uint32_t active_wake_count;     /* number of wakeups back to Active state */
+    uint16_t max_bonds;             /* CONFIG_BT_NIMBLE_MAX_BONDS */
+    uint16_t bond_count;            /* number of bonded peers stored in NVM */
+    bool     pairing_window_open;   /* true if 120s post-boot pairing window is active */
 } ble_link_status_t;
 
 /**

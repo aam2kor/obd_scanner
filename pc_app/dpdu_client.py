@@ -106,6 +106,8 @@ CP_BLE_DLE_TX_OCTETS    = 0xF005
 CP_BLE_PHY_TYPE         = 0xF006
 CP_BLE_IDLE_COUNT       = 0xF007
 CP_BLE_WAKE_COUNT       = 0xF008
+CP_BLE_MAX_BONDS        = 0xF009
+CP_BLE_BOND_COUNT       = 0xF00A
 
 # Backwards-compatible aliases
 CP_ISOTP_BS         = CP_BLOCK_SIZE

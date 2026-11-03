@@ -131,6 +131,8 @@ typedef enum {
     CP_BLE_PHY_TYPE                         = 0xF006, /* Negotiated PHY (1 = 1M, 2 = 2M) */
     CP_BLE_IDLE_COUNT                       = 0xF007, /* Total transitions into Idle state */
     CP_BLE_WAKE_COUNT                       = 0xF008, /* Total wakeups back to Active state */
+    CP_BLE_MAX_BONDS                        = 0xF009, /* Max stored BLE bonds in NVM (CONFIG_BT_NIMBLE_MAX_BONDS) */
+    CP_BLE_BOND_COUNT                       = 0xF00A, /* Active bonded peer count in NVM */
 } dpdu_comparam_id_t;
 
 /* Addressing Types (for CP_ADDRESSING_TYPE) */

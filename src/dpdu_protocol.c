@@ -693,7 +693,9 @@ void dpdu_engine_handle_host_cmd(
                 case CP_BLE_DLE_TX_OCTETS:
                 case CP_BLE_PHY_TYPE:
                 case CP_BLE_IDLE_COUNT:
-                case CP_BLE_WAKE_COUNT: {
+                case CP_BLE_WAKE_COUNT:
+                case CP_BLE_MAX_BONDS:
+                case CP_BLE_BOND_COUNT: {
                     ble_link_status_t ls;
                     if (ble_nus_get_link_status(&ls) == ESP_OK) {
                         if (param_id == CP_BLE_CONN_INTERVAL)        val = (uint32_t)ls.conn_itvl * 1250UL;
@@ -704,6 +706,8 @@ void dpdu_engine_handle_host_cmd(
                         else if (param_id == CP_BLE_PHY_TYPE)        val = (uint32_t)ls.tx_phy;
                         else if (param_id == CP_BLE_IDLE_COUNT)      val = ls.idle_entry_count;
                         else if (param_id == CP_BLE_WAKE_COUNT)      val = ls.active_wake_count;
+                        else if (param_id == CP_BLE_MAX_BONDS)       val = (uint32_t)ls.max_bonds;
+                        else if (param_id == CP_BLE_BOND_COUNT)      val = (uint32_t)ls.bond_count;
                     } else {
                         val = 0UL;
                     }

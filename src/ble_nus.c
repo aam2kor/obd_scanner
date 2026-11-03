@@ -48,12 +48,25 @@ typedef enum {
 static vci_ble_link_state_t    s_link_state         = VCI_BLE_LINK_STATE_ACTIVE;
 static esp_timer_handle_t      s_conn_init_timer    = NULL;
 static esp_timer_handle_t      s_inactivity_timer   = NULL;
+static esp_timer_handle_t      s_pairing_window_timer = NULL;
+static volatile bool           s_pairing_window_open  = true;
+static int64_t                 s_boot_time_us         = 0;
 static uint16_t                s_dle_max_tx_octets  = 27;
 static uint16_t                s_dle_max_rx_octets  = 27;
 static uint8_t                 s_tx_phy             = 1; /* 1 = 1M, 2 = 2M */
 static uint8_t                 s_rx_phy             = 1;
 static uint32_t                s_idle_entry_count   = 0;
 static uint32_t                s_active_wake_count  = 0;
+
+static void on_pairing_window_timer(void *arg)
+{
+    (void)arg;
+    s_pairing_window_open = false;
+    ble_hs_cfg.sm_bonding = 0;
+    ble_hs_cfg.sm_sec_lvl = 1;
+    esp_rom_printf("[NIMBLE SMP] 120s Post-Boot Pairing Window EXPIRED. New pairing rejected.\n");
+    ESP_LOGW(TAG, "BLE 120-second Post-Boot Pairing Window EXPIRED. New pairing rejected.");
+}
 
 static void on_conn_init_timer(void *arg)
 {
@@ -221,11 +234,11 @@ static const struct ble_gatt_svc_def s_gatt_nus_svcs[] = {
                 .flags      = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC,
             },
             {
-                /* NUS TX Characteristic: Notify */
+                /* NUS TX Characteristic: Notify (CCCD requires Security Mode 1 Level 2 encryption) */
                 .uuid       = &s_nus_tx_chr_uuid.u,
                 .access_cb  = gatt_nus_chr_access,
                 .val_handle = &s_tx_val_hdl,
-                .flags      = BLE_GATT_CHR_F_NOTIFY,
+                .flags      = BLE_GATT_CHR_F_NOTIFY | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC,
             },
             { 0 }
         },
@@ -369,7 +382,11 @@ static int ble_nus_gap_event(struct ble_gap_event *event, void *arg)
             return 0;
 
         case BLE_GAP_EVENT_REPEAT_PAIRING:
-            /* Delete stale bond for this peer and allow repeat pairing to succeed seamlessly */
+            if (!s_pairing_window_open || (esp_timer_get_time() - s_boot_time_us > 120000000LL)) {
+                ESP_LOGW(TAG, "Repeat pairing rejected: 120s post-boot pairing window expired");
+                return BLE_GAP_REPEAT_PAIRING_IGNORE;
+            }
+            /* Within 120s window: delete stale bond for this peer and allow repeat pairing to succeed */
             if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) {
                 (void)ble_store_util_delete_peer(&desc.peer_id_addr);
             }
@@ -486,6 +503,9 @@ esp_err_t ble_nus_init(ble_nus_rx_cb_t rx_cb)
         return ret;
     }
 
+    s_boot_time_us = esp_timer_get_time();
+    s_pairing_window_open = true;
+
     ble_hs_cfg.reset_cb          = ble_nus_on_reset;
     ble_hs_cfg.sync_cb           = ble_nus_on_sync;
     /* LE Security Mode 1, Level 2: Unauthenticated Pairing with Encryption (Just Works + NVS Bonding) */
@@ -493,6 +513,7 @@ esp_err_t ble_nus_init(ble_nus_rx_cb_t rx_cb)
     ble_hs_cfg.sm_bonding        = 1;
     ble_hs_cfg.sm_mitm           = 0;
     ble_hs_cfg.sm_sc             = 1;
+    ble_hs_cfg.sm_sec_lvl        = 2;
     ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
     ble_store_config_init();
@@ -552,6 +573,17 @@ esp_err_t ble_nus_init(ble_nus_rx_cb_t rx_cb)
         .skip_unhandled_events = true,
     };
     (void)esp_timer_create(&idle_timer_args, &s_inactivity_timer);
+
+    /* 120-second Post-Boot Pairing Window Timer */
+    esp_timer_create_args_t pair_win_timer_args = {
+        .callback = on_pairing_window_timer,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "vci_pair_win",
+        .skip_unhandled_events = true,
+    };
+    (void)esp_timer_create(&pair_win_timer_args, &s_pairing_window_timer);
+    (void)esp_timer_start_once(s_pairing_window_timer, 120000000ULL); /* 120 seconds */
 
     nimble_port_freertos_init(ble_nus_host_task);
     return ESP_OK;
@@ -632,6 +664,15 @@ esp_err_t ble_nus_get_link_status(ble_link_status_t *out_status)
     out_status->is_idle = (s_link_state == VCI_BLE_LINK_STATE_IDLE);
     out_status->idle_entry_count = s_idle_entry_count;
     out_status->active_wake_count = s_active_wake_count;
+#ifdef CONFIG_BT_NIMBLE_MAX_BONDS
+    out_status->max_bonds = CONFIG_BT_NIMBLE_MAX_BONDS;
+#else
+    out_status->max_bonds = 4;
+#endif
+    int b_count = 0;
+    (void)ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &b_count);
+    out_status->bond_count = (uint16_t)b_count;
+    out_status->pairing_window_open = s_pairing_window_open && ((esp_timer_get_time() - s_boot_time_us) < 120000000LL);
     return ESP_OK;
 }
 

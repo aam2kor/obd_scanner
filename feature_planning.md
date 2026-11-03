@@ -112,14 +112,15 @@ flowchart TD
   - Verified continuous back-to-back ISO 22900-2 D-PDU / UDS request-response streaming over encrypted NUS channel with zero drops or errors.
 - [x] **Verification & Test Evidence:** Verified 100% on live hardware via `tests/test_phase2_ble.py`. Documented in `TEST_REPORT_PHASE2_BLE.md`.
 
-### Phase 3: Security Hardening & 120s Pairing Window
-- [ ] **Task 3.1: 4-Device LRU Bonding Configuration**
-  - Update `sdkconfig.esp32dev` to `CONFIG_BT_NIMBLE_MAX_BONDS=4`.
-- [ ] **Task 3.2: 120-Second Post-Boot Pairing Window Enforcement**
-  - Record boot timestamp via `esp_timer_get_time()`.
-  - In `BLE_GAP_EVENT_REPEAT_PAIRING` and the NimBLE Security Manager pairing callback, reject pairing with `BLE_SM_ERR_AUTHREQ` if `esp_timer_get_time() > 120 * 1000000ULL` and peer address is not already bonded in NVS.
-- [ ] **Task 3.3: CCCD Encryption Gating**
-  - In `gatt_nus_chr_access()`, verify that the link is encrypted before allowing subscription updates to the CCCD descriptor (`BLE_GATT_CHR_F_NOTIFY`).
+### Phase 3: Security Hardening & 120s Pairing Window [COMPLETED & VERIFIED]
+- [x] **Task 3.1: 4-Device LRU Bonding Configuration**
+  - Updated `sdkconfig.esp32dev` to `CONFIG_BT_NIMBLE_MAX_BONDS=4` and exposed runtime ComParam `CP_BLE_MAX_BONDS` (0xF009).
+- [x] **Task 3.2: 120-Second Post-Boot Pairing Window Enforcement**
+  - Recorded boot timestamp via `esp_timer_get_time()`.
+  - Rejects unauthorized pairing requests with `BLE_SM_ERR_AUTHREQ` after 120s post-boot window while permitting re-connections from previously bonded peers.
+- [x] **Task 3.3: CCCD Encryption Gating**
+  - In `gatt_nus_chr_access()`, verified link encryption before allowing subscription updates to CCCD descriptor (0x2902). Unencrypted writes rejected with `BLE_ATT_ERR_INSUFFICIENT_ENC`.
+- [x] **Verification & Test Evidence:** Verified 100% on live hardware via `tests/test_phase3_ble.py`. Documented in `TEST_REPORT_PHASE3_BLE.md`.
 
 ### Phase 4: Host Tooling Alignment & Full Hardware Verification
 - [ ] **Task 4.1: Host Discovery Updates**

@@ -121,17 +121,19 @@ async def run_tests():
 
     await ensure_bluez_just_works_agent()
 
-    # Step 0: Initial Hardware Reset to start deterministic 120s timer
+    # Step 0: Discover target address once, purge any stale bond, then POR reset board
+    print("Pre-flight: Detecting target VCI and clearing stale host bond...", flush=True)
+    initial_device, initial_name = await discover_vci(scan_timeout=8.0)
+    device_addr = initial_device.address
+    remove_host_bond(device_addr)
+    await asyncio.sleep(0.5)
+
+    # Initial Hardware Reset to start deterministic 120s timer
     t_boot = reset_hardware_vci("/dev/ttyUSB0")
     await asyncio.sleep(1.5)  # Allow radio stack and advertising to start
 
-    # Discover target device
+    # Fresh discovery so BlueZ registers clean unbonded D-Bus device object
     target_device, target_name = await discover_vci(scan_timeout=8.0)
-    device_addr = target_device.address
-
-    # Remove any existing host-side bond before testing
-    remove_host_bond(device_addr)
-    await asyncio.sleep(0.5)
 
     # -------------------------------------------------------------------------
     # TC-P3-01: CCCD (0x2902) Encryption Gating Verification
@@ -328,13 +330,15 @@ async def run_tests():
     print(f"Elapsed time post-boot: {time.time() - t_boot:.1f} s (> 120.0 s)", flush=True)
     print("Purging host bond to present as a NEW unbonded client after 120s window...", flush=True)
     remove_host_bond(device_addr)
-    await asyncio.sleep(1.0)
+    await asyncio.sleep(0.5)
+    # Rediscover peripheral so BlueZ creates fresh unbonded D-Bus device object
+    target_unbonded_dev, _ = await discover_vci(scan_timeout=8.0)
 
     passed_03 = False
     detail_03 = ""
 
     try:
-        client_unbonded = BleakClient(target_device)
+        client_unbonded = BleakClient(target_unbonded_dev)
         await client_unbonded.connect(timeout=10.0)
         print("Link connected at link layer. Attempting new pairing after 120s window...", flush=True)
 
@@ -401,6 +405,8 @@ async def run_tests():
         target_device2, target_name2 = await discover_vci(scan_timeout=8.0)
         remove_host_bond(target_device2.address)
         await asyncio.sleep(0.5)
+        # Rescan to recreate fresh unbonded D-Bus device
+        target_device2, target_name2 = await discover_vci(scan_timeout=8.0)
 
         # Pair within fresh window
         client_retention = BleakClient(target_device2)
