@@ -81,3 +81,4 @@ When the user asks to use `vci-tdd-team` (or says "implement with implementer an
    - Test case definitions and assertions (QA Tester).
 3. Execute the closed loop until all test cases pass.
 4. Conclude by staging all changes, committing, and pushing to `origin/main` as required by repository rules.
+
