@@ -235,7 +235,7 @@ class LeanDpduBleClient:
                     return
                 adv_name = device.name or adv_data.local_name or ""
                 service_uuids = [u.lower() for u in (adv_data.service_uuids or [])]
-                if adv_name == self.device_name or NUS_SERVICE_UUID in service_uuids:
+                if adv_name.startswith("ESP32-OBD-VCI") or adv_name == self.device_name or NUS_SERVICE_UUID in service_uuids:
                     if not found_evt.is_set():
                         target_device = device
                         found_evt.set()

@@ -260,6 +260,7 @@ class LeanDpduSerialClient:
 
     def __init__(self, port: str = "/dev/ttyUSB0", baud: int = 115200):
         self.ser = serial.Serial(port, baud, timeout=0.005)
+        self.ser.reset_input_buffer()
         self.parser = DpduStreamParser()
         self._rx_queue: list[DpduFrame] = []
         self._next_cop_id = 1
@@ -273,12 +274,8 @@ class LeanDpduSerialClient:
         self.ser.dtr = False
         self.ser.rts = True
         time.sleep(0.1)
-        self.ser.reset_input_buffer()
         self.ser.rts = False
-        time.sleep(1.2)
-        while self.ser.in_waiting:
-            self.ser.read(self.ser.in_waiting)
-            time.sleep(0.01)
+        time.sleep(1.0)
         self.ser.reset_input_buffer()
         self.parser.reset()
         self._rx_queue.clear()

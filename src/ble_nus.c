@@ -6,6 +6,8 @@
 #include "ble_nus.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "nvs.h"
+#include "esp_bt.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -32,7 +34,52 @@ static uint16_t                s_tx_val_hdl         = 0;
 static uint8_t                 s_own_addr_type      = BLE_OWN_ADDR_PUBLIC;
 static bool                    s_tx_notify_enabled  = false;
 static volatile bool           s_conn_encrypted     = false;
-static char                    s_dis_serial_str[24] = {0};
+static char                    s_dis_serial_str[16] = {0};
+static char                    s_ble_device_name[32] = {0};
+
+/**
+ * @brief Retrieve or generate an 8-character alphanumeric serial number stored in NVS.
+ * If unprovisioned, generates a deterministic 8-character uppercase hex string from
+ * the hardware eFuse MAC address and commits it to NVS.
+ */
+static esp_err_t vci_get_or_create_nvs_serial(char *out_serial, size_t max_len)
+{
+    if (out_serial == NULL || max_len < 9) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t nvs_hdl;
+    esp_err_t err = nvs_open("vci_cfg", NVS_READWRITE, &nvs_hdl);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "nvs_open(vci_cfg) failed: %d", err);
+        return err;
+    }
+
+    size_t req_len = max_len;
+    err = nvs_get_str(nvs_hdl, "serial_num", out_serial, &req_len);
+    if (err == ESP_OK && strlen(out_serial) == 8) {
+        ESP_LOGI(TAG, "Loaded serial from NVS: '%s'", out_serial);
+        nvs_close(nvs_hdl);
+        return ESP_OK;
+    }
+
+    /* Unprovisioned: derive 8-character uppercase hex serial from eFuse MAC */
+    uint8_t mac[6] = {0};
+    (void)esp_efuse_mac_get_default(mac);
+    /* Use 4 bytes: mac[2..5] -> 8 alphanumeric uppercase hex chars */
+    snprintf(out_serial, max_len, "%02X%02X%02X%02X", mac[2], mac[3], mac[4], mac[5]);
+
+    err = nvs_set_str(nvs_hdl, "serial_num", out_serial);
+    if (err == ESP_OK) {
+        (void)nvs_commit(nvs_hdl);
+        ESP_LOGI(TAG, "Provisioned new 8-char serial in NVS: '%s'", out_serial);
+    } else {
+        ESP_LOGW(TAG, "Failed to persist serial in NVS: %d", err);
+    }
+
+    nvs_close(nvs_hdl);
+    return ESP_OK;
+}
 
 /* Nordic UART Service (NUS) 128-bit UUIDs (Little-Endian) */
 /* 6E400001-B5A3-F393-E0A9-E50E24DCCA9E */
@@ -191,6 +238,7 @@ static void ble_nus_start_advertising(void)
     struct ble_hs_adv_fields fields;
     memset(&fields, 0, sizeof(fields));
 
+    /* Flags: LE General Discoverable Mode + BR/EDR Not Supported (LE-only controller) */
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     const char *name = ble_svc_gap_device_name();
     fields.name = (uint8_t *)name;
@@ -216,18 +264,19 @@ static void ble_nus_start_advertising(void)
         return;
     }
 
+    /* 100 ms advertising interval (0x00A0 * 0.625 ms = 100.0 ms) */
     struct ble_gap_adv_params adv_params;
     memset(&adv_params, 0, sizeof(adv_params));
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    adv_params.itvl_min  = 0x20; /* 20 ms */
-    adv_params.itvl_max  = 0x40; /* 40 ms */
+    adv_params.itvl_min  = 0x00A0; /* 100 ms */
+    adv_params.itvl_max  = 0x00A0; /* 100 ms */
 
     rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, ble_nus_gap_event, NULL);
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         ESP_LOGE(TAG, "ble_gap_adv_start failed: %d", rc);
     } else {
-        ESP_LOGI(TAG, "BLE Advertising started as '%s'", name);
+        ESP_LOGI(TAG, "BLE Advertising started as '%s' (interval=100ms, flags=0x%02X)", name, fields.flags);
     }
 }
 
@@ -290,11 +339,19 @@ esp_err_t ble_nus_init(ble_nus_rx_cb_t rx_cb)
     ble_svc_gatt_init();
     ble_svc_dis_init();
 
-    /* Populate Device Information Service (0x180A) characteristics */
-    uint8_t mac[6] = {0};
-    (void)esp_efuse_mac_get_default(mac);
-    snprintf(s_dis_serial_str, sizeof(s_dis_serial_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    /* Configure Bluetooth LE Power Class 2: maximum output power <= +4 dBm (set to +3 dBm / ESP_PWR_LVL_P3) */
+    ret = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P3);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "esp_ble_tx_power_set(DEFAULT, P3) returned: %d", ret);
+    }
+    ret = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P3);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "esp_ble_tx_power_set(ADV, P3) returned: %d", ret);
+    }
+
+    /* Retrieve 8-character alphanumeric serial number from NVS */
+    (void)vci_get_or_create_nvs_serial(s_dis_serial_str, sizeof(s_dis_serial_str));
+    snprintf(s_ble_device_name, sizeof(s_ble_device_name), "%s-%s", VCI_BLE_DEVICE_NAME, s_dis_serial_str);
 
     (void)ble_svc_dis_manufacturer_name_set("OpenVCI");
     (void)ble_svc_dis_model_number_set(VCI_BLE_DEVICE_NAME);
@@ -312,7 +369,7 @@ esp_err_t ble_nus_init(ble_nus_rx_cb_t rx_cb)
         return ESP_FAIL;
     }
 
-    ble_svc_gap_device_name_set(VCI_BLE_DEVICE_NAME);
+    ble_svc_gap_device_name_set(s_ble_device_name);
     ble_att_set_preferred_mtu(256);
 
     nimble_port_freertos_init(ble_nus_host_task);
