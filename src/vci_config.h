@@ -37,6 +37,8 @@
 #define VCI_MF_POOL_COUNT           3U      /* 3x 4,095-byte Multi-Frame RX assembly buffers */
 #define VCI_ISOTP_MAX_PDU_LEN       4095U   /* Max standard ISO 15765-2 12-bit FF payload */
 #define VCI_MAX_PACKET_PAYLOAD      4103U   /* 8B header fields + 4095B N-PDU */
+#define VCI_BLE_RX_RING_SIZE        512U    /* SPSC lock-free ringbuffer size for BLE NUS RX */
+#define VCI_CAN_MAX_DLC             8U      /* Classic CAN maximum data length code in bytes */
 
 /* Firmware & Hardware Identification (for PDUGetVersion / IOCTL_GET_CABLE_ID) */
 #define VCI_FW_VERSION_U32          0x00020100UL /* v2.1.0 */

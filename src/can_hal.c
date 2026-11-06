@@ -15,6 +15,8 @@
 #pragma GCC diagnostic pop
 #include <string.h>
 
+#define VCI_CAN_HAL_QUEUE_DEPTH         16U
+
 static QueueHandle_t s_q_tester_to_ecu = NULL;
 static QueueHandle_t s_q_ecu_to_tester = NULL;
 static bool          s_started         = false;
@@ -24,10 +26,10 @@ static bool          s_twai_installed  = false;
 void can_hal_init(void)
 {
     if (s_q_tester_to_ecu == NULL) {
-        s_q_tester_to_ecu = xQueueCreate(16, sizeof(vci_can_frame_t));
+        s_q_tester_to_ecu = xQueueCreate(VCI_CAN_HAL_QUEUE_DEPTH, sizeof(vci_can_frame_t));
     }
     if (s_q_ecu_to_tester == NULL) {
-        s_q_ecu_to_tester = xQueueCreate(16, sizeof(vci_can_frame_t));
+        s_q_ecu_to_tester = xQueueCreate(VCI_CAN_HAL_QUEUE_DEPTH, sizeof(vci_can_frame_t));
     }
 }
 
@@ -113,7 +115,7 @@ static TickType_t ms_to_ticks(uint32_t timeout_ms)
 
 esp_err_t can_hal_send(const vci_can_frame_t *frame, uint32_t timeout_ms)
 {
-    if (!s_started || frame == NULL || frame->dlc > 8U) {
+    if (!s_started || frame == NULL || frame->dlc > VCI_CAN_MAX_DLC) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -163,7 +165,7 @@ esp_err_t can_hal_recv(vci_can_frame_t *frame, uint32_t timeout_ms)
 
     frame->id      = msg.identifier;
     frame->is_extd = msg.extd ? true : false;
-    frame->dlc     = (msg.data_length_code <= 8U) ? msg.data_length_code : 8U;
+    frame->dlc     = (msg.data_length_code <= VCI_CAN_MAX_DLC) ? msg.data_length_code : VCI_CAN_MAX_DLC;
     memset(frame->data, 0, sizeof(frame->data));
     memcpy(frame->data, msg.data, frame->dlc);
     return ESP_OK;

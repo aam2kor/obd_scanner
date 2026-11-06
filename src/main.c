@@ -34,8 +34,7 @@ static dpdu_rx_parser_t  s_ble_parser;
 static dpdu_rx_parser_t  s_uart_parser;
 
 /* Single-producer (NimBLE task) / single-consumer (host_io_task) BLE RX ringbuffer (512B) */
-#define BLE_RX_RING_SIZE         512U
-static uint8_t           s_ble_rx_ring[BLE_RX_RING_SIZE];
+static uint8_t           s_ble_rx_ring[VCI_BLE_RX_RING_SIZE];
 static volatile uint16_t s_ble_rx_head = 0U;
 static volatile uint16_t s_ble_rx_tail = 0U;
 
@@ -115,21 +114,10 @@ static void host_send_packet(
         hdr[6] = (uint8_t)(payload_len & 0xFFU);
         hdr[7] = (uint8_t)((payload_len >> 8) & 0xFFU);
 
-        /* Compute CRC16-CCITT over Msg_Type..Payload */
-        uint16_t crc = 0xFFFFU;
-        for (size_t i = 2U; i < DPDU_HEADER_SIZE; i++) {
-            crc ^= (uint16_t)hdr[i] << 8;
-            for (int b = 0; b < 8; b++) {
-                crc = (crc & 0x8000U) ? (uint16_t)((crc << 1) ^ 0x1021U) : (uint16_t)(crc << 1);
-            }
-        }
-        for (size_t i = 0U; i < payload_len; i++) {
-            crc ^= (uint16_t)payload[i] << 8;
-            for (int b = 0; b < 8; b++) {
-                crc = (crc & 0x8000U) ? (uint16_t)((crc << 1) ^ 0x1021U) : (uint16_t)(crc << 1);
-            }
-        }
-        uint8_t crc_bytes[2] = {
+        /* Compute CRC16-CCITT over Msg_Type..Payload using modular helper */
+        uint16_t crc = dpdu_crc16_update(0xFFFFU, &hdr[2], DPDU_HEADER_SIZE - 2U);
+        crc = dpdu_crc16_update(crc, payload, payload_len);
+        uint8_t crc_bytes[DPDU_CRC_SIZE] = {
             (uint8_t)(crc & 0xFFU),
             (uint8_t)((crc >> 8) & 0xFFU)
         };
@@ -191,7 +179,7 @@ static void on_ble_nus_rx(const uint8_t *data, size_t len)
 {
     uint16_t head = s_ble_rx_head;
     for (size_t i = 0U; i < len; i++) {
-        uint16_t next = (uint16_t)((head + 1U) % BLE_RX_RING_SIZE);
+        uint16_t next = (uint16_t)((head + 1U) % VCI_BLE_RX_RING_SIZE);
         if (next != s_ble_rx_tail) {
             s_ble_rx_ring[head] = data[i];
             head = next;
@@ -222,7 +210,7 @@ static void host_io_task(void *arg)
         while (tail != s_ble_rx_head) {
             had_activity = true;
             uint8_t byte = s_ble_rx_ring[tail];
-            tail = (uint16_t)((tail + 1U) % BLE_RX_RING_SIZE);
+            tail = (uint16_t)((tail + 1U) % VCI_BLE_RX_RING_SIZE);
             s_ble_rx_tail = tail;
 
             dpdu_parse_result_t res = dpdu_parser_feed_byte(&s_ble_parser, byte);

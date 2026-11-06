@@ -17,6 +17,20 @@
 
 #define VCI_BLE_DEVICE_NAME     "ESP32-OBD-VCI"
 
+/* Bluetooth Core Spec Connection Parameter & Timing Constants */
+#define VCI_BLE_CONN_ITVL_MIN_ACTIVE_UNITS     6U      /* 7.5 ms (6 * 1.25 ms) */
+#define VCI_BLE_CONN_ITVL_MAX_ACTIVE_UNITS     12U     /* 15.0 ms (12 * 1.25 ms) */
+#define VCI_BLE_CONN_LATENCY_ACTIVE            0U
+#define VCI_BLE_CONN_LATENCY_IDLE              4U
+#define VCI_BLE_SUPERVISION_TIMEOUT_UNITS      500U    /* 5000 ms (500 * 10 ms) */
+#define VCI_BLE_INACTIVITY_TIMEOUT_US          10000000ULL /* 10 seconds in microseconds */
+#define VCI_BLE_PAIRING_WINDOW_US              120000000ULL/* 120 seconds in microseconds */
+#define VCI_BLE_CONN_INIT_DELAY_US             800000ULL   /* 800 ms in microseconds */
+#define VCI_BLE_ADV_INTERVAL_UNITS             0x00A0U /* 100 ms (160 * 0.625 ms) */
+#define VCI_BLE_DLE_MAX_TX_OCTETS              251U    /* Maximum Link Layer TX payload */
+#define VCI_BLE_DLE_MAX_TX_TIME_US             2120U   /* Maximum Link Layer TX duration */
+#define VCI_BLE_ATT_PREFERRED_MTU              256U    /* Preferred ATT MTU */
+
 /**
  * @brief Link Layer connection and negotiation status structure.
  */

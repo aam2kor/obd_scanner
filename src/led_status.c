@@ -70,6 +70,6 @@ void led_status_set_mode(vci_led_mode_t mode)
 
 void led_status_pulse_activity(void)
 {
-    s_activity_until_us = esp_timer_get_time() + 250000LL; /* 250ms burst */
+    s_activity_until_us = esp_timer_get_time() + VCI_LED_ACTIVITY_PULSE_DURATION_US;
 }
 

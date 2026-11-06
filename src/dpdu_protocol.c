@@ -39,7 +39,7 @@ uint16_t dpdu_crc16_ccitt(const uint8_t *data, size_t len)
     return crc;
 }
 
-static uint16_t dpdu_crc16_update(uint16_t crc, const uint8_t *data, size_t len)
+uint16_t dpdu_crc16_update(uint16_t crc, const uint8_t *data, size_t len)
 {
     for (size_t i = 0; i < len; i++) {
         crc ^= (uint16_t)data[i] << 8;

@@ -68,29 +68,36 @@ static void on_pairing_window_timer(void *arg)
     ESP_LOGW(TAG, "BLE 120-second Post-Boot Pairing Window EXPIRED. New pairing rejected.");
 }
 
+static int ble_nus_update_conn_params(uint16_t latency)
+{
+    if (s_conn_hdl == BLE_HS_CONN_HANDLE_NONE) {
+        return BLE_HS_ENOTCONN;
+    }
+    struct ble_gap_upd_params params = {
+        .itvl_min = VCI_BLE_CONN_ITVL_MIN_ACTIVE_UNITS,
+        .itvl_max = VCI_BLE_CONN_ITVL_MAX_ACTIVE_UNITS,
+        .latency = latency,
+        .supervision_timeout = VCI_BLE_SUPERVISION_TIMEOUT_UNITS,
+        .min_ce_len = 0,
+        .max_ce_len = 0,
+    };
+    return ble_gap_update_params(s_conn_hdl, &params);
+}
+
 static void on_conn_init_timer(void *arg)
 {
     (void)arg;
     if (s_conn_hdl == BLE_HS_CONN_HANDLE_NONE) {
         return;
     }
-    /* Active Diagnostic State: Conn_Interval = 7.5 - 15.0 ms, Latency = 0, Supervision_Timeout = 5000 ms */
-    struct ble_gap_upd_params active_params = {
-        .itvl_min = 6,              /* 7.5 ms (6 * 1.25 ms) */
-        .itvl_max = 12,             /* 15.0 ms (12 * 1.25 ms) */
-        .latency = 0,               /* 0 */
-        .supervision_timeout = 500, /* 5000 ms (500 * 10 ms) */
-        .min_ce_len = 0,
-        .max_ce_len = 0,
-    };
-    int rc = ble_gap_update_params(s_conn_hdl, &active_params);
+    int rc = ble_nus_update_conn_params(VCI_BLE_CONN_LATENCY_ACTIVE);
     esp_rom_printf("[NIMBLE GAP] conn_update rc=%d\n", rc);
     ESP_LOGI(TAG, "Initiated Active Conn Params: itvl=[7.5, 15.0]ms, latency=0, timeout=5000ms (rc=%d)", rc);
 
     /* Arm 10-second inactivity timer */
     if (s_inactivity_timer != NULL) {
         (void)esp_timer_stop(s_inactivity_timer);
-        (void)esp_timer_start_once(s_inactivity_timer, 10000000ULL);
+        (void)esp_timer_start_once(s_inactivity_timer, VCI_BLE_INACTIVITY_TIMEOUT_US);
     }
 }
 
@@ -103,16 +110,7 @@ static void on_inactivity_timer(void *arg)
     if (s_link_state == VCI_BLE_LINK_STATE_ACTIVE) {
         s_link_state = VCI_BLE_LINK_STATE_IDLE;
         s_idle_entry_count++;
-        /* Idle State (>10s inactivity): Peripheral_Latency = 4, Timeout = 5000 ms */
-        struct ble_gap_upd_params idle_params = {
-            .itvl_min = 6,              /* 7.5 ms */
-            .itvl_max = 12,             /* 15.0 ms */
-            .latency = 4,               /* Peripheral_Latency = 4 */
-            .supervision_timeout = 500, /* 5000 ms */
-            .min_ce_len = 0,
-            .max_ce_len = 0,
-        };
-        int rc = ble_gap_update_params(s_conn_hdl, &idle_params);
+        int rc = ble_nus_update_conn_params(VCI_BLE_CONN_LATENCY_IDLE);
         ESP_LOGI(TAG, "Link Idle (>10s GATT/CAN inactivity): Requested Peripheral_Latency=4 (rc=%d)", rc);
     }
 }
@@ -266,12 +264,12 @@ static int ble_nus_gap_event(struct ble_gap_event *event, void *arg)
                 (void)ble_gattc_exchange_mtu(s_conn_hdl, NULL, NULL);
 
                 /* Request Data Length Extension (DLE): connMaxTxOctets = 251, connMaxTxTime = 2120 us */
-                (void)ble_gap_set_data_len(s_conn_hdl, 251, 2120);
+                (void)ble_gap_set_data_len(s_conn_hdl, VCI_BLE_DLE_MAX_TX_OCTETS, VCI_BLE_DLE_MAX_TX_TIME_US);
 
                 /* Schedule Active Connection Parameters update fallback within < 1.0s (800 ms) */
                 if (s_conn_init_timer != NULL) {
                     (void)esp_timer_stop(s_conn_init_timer);
-                    (void)esp_timer_start_once(s_conn_init_timer, 800000ULL); /* 800 ms */
+                    (void)esp_timer_start_once(s_conn_init_timer, VCI_BLE_CONN_INIT_DELAY_US);
                 }
 
                 ESP_LOGI(TAG, "BLE Central connected (conn_handle=%u)", s_conn_hdl);
@@ -448,8 +446,8 @@ static void ble_nus_start_advertising(void)
     memset(&adv_params, 0, sizeof(adv_params));
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-    adv_params.itvl_min  = 0x00A0; /* 100 ms */
-    adv_params.itvl_max  = 0x00A0; /* 100 ms */
+    adv_params.itvl_min  = VCI_BLE_ADV_INTERVAL_UNITS; /* 100 ms (160 * 0.625 ms) */
+    adv_params.itvl_max  = VCI_BLE_ADV_INTERVAL_UNITS; /* 100 ms (160 * 0.625 ms) */
 
     rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, ble_nus_gap_event, NULL);
     if (rc != 0 && rc != BLE_HS_EALREADY) {
@@ -583,7 +581,7 @@ esp_err_t ble_nus_init(ble_nus_rx_cb_t rx_cb)
         .skip_unhandled_events = true,
     };
     (void)esp_timer_create(&pair_win_timer_args, &s_pairing_window_timer);
-    (void)esp_timer_start_once(s_pairing_window_timer, 120000000ULL); /* 120 seconds */
+    (void)esp_timer_start_once(s_pairing_window_timer, VCI_BLE_PAIRING_WINDOW_US); /* 120 seconds */
 
     nimble_port_freertos_init(ble_nus_host_task);
     return ESP_OK;
@@ -621,22 +619,14 @@ void ble_nus_notify_activity(void)
     if (s_link_state == VCI_BLE_LINK_STATE_IDLE) {
         s_link_state = VCI_BLE_LINK_STATE_ACTIVE;
         s_active_wake_count++;
-        struct ble_gap_upd_params active_params = {
-            .itvl_min = 6,              /* 7.5 ms */
-            .itvl_max = 12,             /* 15.0 ms */
-            .latency = 0,               /* 0 */
-            .supervision_timeout = 500, /* 5000 ms */
-            .min_ce_len = 0,
-            .max_ce_len = 0,
-        };
-        int rc = ble_gap_update_params(s_conn_hdl, &active_params);
+        int rc = ble_nus_update_conn_params(VCI_BLE_CONN_LATENCY_ACTIVE);
         ESP_LOGI(TAG, "Link Activity: Restored Peripheral_Latency=0 (rc=%d)", rc);
     }
     if (s_inactivity_timer != NULL) {
         if (esp_timer_is_active(s_inactivity_timer)) {
-            (void)esp_timer_restart(s_inactivity_timer, 10000000ULL);
+            (void)esp_timer_restart(s_inactivity_timer, VCI_BLE_INACTIVITY_TIMEOUT_US);
         } else {
-            (void)esp_timer_start_once(s_inactivity_timer, 10000000ULL);
+            (void)esp_timer_start_once(s_inactivity_timer, VCI_BLE_INACTIVITY_TIMEOUT_US);
         }
     }
 }
@@ -672,7 +662,7 @@ esp_err_t ble_nus_get_link_status(ble_link_status_t *out_status)
     int b_count = 0;
     (void)ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &b_count);
     out_status->bond_count = (uint16_t)b_count;
-    out_status->pairing_window_open = s_pairing_window_open && ((esp_timer_get_time() - s_boot_time_us) < 120000000LL);
+    out_status->pairing_window_open = s_pairing_window_open && ((esp_timer_get_time() - s_boot_time_us) < (int64_t)VCI_BLE_PAIRING_WINDOW_US);
     return ESP_OK;
 }
 

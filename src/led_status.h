@@ -13,6 +13,8 @@ typedef enum {
     VCI_LED_CONNECTED_IDLE,     /* Steady 1 Hz blink (500ms ON / 500ms OFF) */
 } vci_led_mode_t;
 
+#define VCI_LED_ACTIVITY_PULSE_DURATION_US  250000LL /* 250 ms activity flash */
+
 /**
  * @brief Initialize GPIO 2 and start the background status LED task on Core 0.
  */

@@ -283,6 +283,11 @@ uint32_t dpdu_timestamp_us(void);
 uint16_t dpdu_crc16_ccitt(const uint8_t *data, size_t len);
 
 /**
+ * @brief Update a running CRC-16/CCITT-FALSE value over an incoming byte chunk.
+ */
+uint16_t dpdu_crc16_update(uint16_t crc, const uint8_t *data, size_t len);
+
+/**
  * @brief Initialize or reset a stream parser instance.
  */
 void dpdu_parser_init(dpdu_rx_parser_t *parser);
