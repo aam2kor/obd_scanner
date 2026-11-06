@@ -597,7 +597,11 @@ async def _scan_once() -> Tuple[object, float, Optional[int]]:
         nonlocal found_dev, rssi_val
         name = device.name or adv_data.local_name or ""
         uuids = [u.lower() for u in (adv_data.service_uuids or [])]
-        if name.startswith("ESP32-OBD-VCI") or name == VCI_BLE_NAME or NUS_SERVICE_UUID in uuids:
+        if (
+            name.startswith("ESP32-OBD-VCI")
+            or name == VCI_BLE_NAME
+            or NUS_SERVICE_UUID in uuids
+        ):
             if not found_evt.is_set():
                 found_dev = device
                 if adv_data.rssi is not None:
@@ -647,6 +651,11 @@ async def run_ble_benchmarks(ser: LeanDpduSerialClient, iterations: int = 3) -> 
             await client.connect()
             try:
                 await client.pair()
+            except Exception:
+                pass
+            try:
+                # Prime LE Security Mode 1 Level 2 encryption before CCCD subscription
+                await client.read_gatt_char("00002a29-0000-1000-8000-00805f9b34fb")
             except Exception:
                 pass
             t1 = time.perf_counter()
@@ -977,6 +986,11 @@ async def run_ble_benchmarks(ser: LeanDpduSerialClient, iterations: int = 3) -> 
             await c_tmp.connect()
             try:
                 await c_tmp.pair()
+            except Exception:
+                pass
+            try:
+                # Prime LE Security Mode 1 Level 2 encryption before CCCD subscription
+                await c_tmp.read_gatt_char("00002a29-0000-1000-8000-00805f9b34fb")
             except Exception:
                 pass
             t1 = time.perf_counter()

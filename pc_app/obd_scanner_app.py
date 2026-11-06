@@ -235,7 +235,11 @@ class LeanDpduBleClient:
                     return
                 adv_name = device.name or adv_data.local_name or ""
                 service_uuids = [u.lower() for u in (adv_data.service_uuids or [])]
-                if adv_name.startswith("ESP32-OBD-VCI") or adv_name == self.device_name or NUS_SERVICE_UUID in service_uuids:
+                if (
+                    adv_name.startswith("ESP32-OBD-VCI")
+                    or adv_name == self.device_name
+                    or NUS_SERVICE_UUID in service_uuids
+                ):
                     if not found_evt.is_set():
                         target_device = device
                         found_evt.set()
@@ -265,16 +269,16 @@ class LeanDpduBleClient:
                     await self.client.pair()
                 except Exception:
                     pass
+                try:
+                    # Prime LE Security Mode 1, Level 2 encryption handshake via DIS read before CCCD subscription
+                    await self.client.read_gatt_char("00002a29-0000-1000-8000-00805f9b34fb")
+                except Exception:
+                    pass
                 self.parser.reset()
                 self._deferred.clear()
                 while not self._rx_queue.empty():
                     self._rx_queue.get_nowait()
                 await self.client.start_notify(NUS_TX_CHAR_UUID, self._on_nus_tx_notify)
-                try:
-                    # Prime LE Security Mode 1, Level 2 encryption handshake via DIS read before writes
-                    await self.client.read_gatt_char("00002a29-0000-1000-8000-00805f9b34fb")
-                except Exception:
-                    pass
                 return f"{target_device.name or self.device_name} [{target_device.address}] (LE Security Mode 1, Level 2)"
             except Exception as e:
                 last_err = e
